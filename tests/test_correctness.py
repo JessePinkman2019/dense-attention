@@ -11,7 +11,7 @@ import os
 import math
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from python.sparse_attention import sparse_attention, sparse_attention_ref, generate_random_sparse_mask
+from python.attention import attention, attention_ref
 
 
 def test_output_correctness(B=2, H=4, N=64, D=64, sparsity=0.75, dtype=torch.bfloat16):

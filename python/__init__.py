@@ -1,3 +1,3 @@
-from .sparse_attention import sparse_attention, sparse_attention_func
+from .attention import attention, attention_ref
 
-__all__ = ["sparse_attention", "sparse_attention_func"]
+__all__ = ["attention", "attention_ref"]

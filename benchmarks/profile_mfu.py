@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from python.sparse_attention import sparse_attention, generate_random_sparse_mask
-from python.benchmark import measure_mfu, attention_flops, sparse_attention_flops
+from python.benchmark import measure_mfu, attention_flops
 
 
 def profile_all_configs():

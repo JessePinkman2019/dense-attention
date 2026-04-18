@@ -11,7 +11,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from python.sparse_attention import sparse_attention, generate_random_sparse_mask
+from python.attention import attention, attention_ref
 from python.benchmark import measure_mfu
 
 try:
