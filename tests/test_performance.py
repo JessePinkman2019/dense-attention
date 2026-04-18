@@ -19,7 +19,6 @@ def test_latency_scaling():
     device = "cuda"
     dtype = torch.bfloat16
     B, H, D = 16, 12, 64
-    sparsity = 0.75
 
     print("=== 延迟缩放测试 ===")
     print(f"{'N':>6} {'latency(ms)':>12} {'MFU%':>8}")
@@ -29,11 +28,10 @@ def test_latency_scaling():
         q = torch.randn(B, H, N, D, device=device, dtype=dtype)
         k = torch.randn(B, H, N, D, device=device, dtype=dtype)
         v = torch.randn(B, H, N, D, device=device, dtype=dtype)
-        mask = generate_random_sparse_mask(B, H, N, sparsity=sparsity, device=device)
 
         m = measure_mfu(
-            lambda: sparse_attention(q, k, v, mask),
-            B, H, N, D, sparsity=sparsity, dtype=dtype
+            lambda: attention(q, k, v),
+            B, H, N, D, dtype=dtype
         )
         print(f"{N:>6} {m['latency_ms']:>12.3f} {m['mfu_percent']:>8.1f}%")
 
@@ -43,7 +41,6 @@ def test_batch_scaling():
     device = "cuda"
     dtype = torch.bfloat16
     H, N, D = 12, 512, 64
-    sparsity = 0.75
 
     print("\n=== Batch Size 缩放测试（N=512）===")
     print(f"{'B':>6} {'latency(ms)':>12} {'MFU%':>8} {'throughput(seq/s)':>18}")
@@ -53,11 +50,10 @@ def test_batch_scaling():
         q = torch.randn(B, H, N, D, device=device, dtype=dtype)
         k = torch.randn(B, H, N, D, device=device, dtype=dtype)
         v = torch.randn(B, H, N, D, device=device, dtype=dtype)
-        mask = generate_random_sparse_mask(B, H, N, sparsity=sparsity, device=device)
 
         m = measure_mfu(
-            lambda: sparse_attention(q, k, v, mask),
-            B, H, N, D, sparsity=sparsity, dtype=dtype
+            lambda: attention(q, k, v),
+            B, H, N, D, dtype=dtype
         )
         throughput = B / (m['latency_ms'] / 1000.0)
         print(f"{B:>6} {m['latency_ms']:>12.3f} {m['mfu_percent']:>8.1f}% {throughput:>18.1f}")

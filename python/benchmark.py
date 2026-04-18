@@ -6,13 +6,13 @@ import torch
 import math
 
 
-def get_a100_peak_tflops(dtype=torch.bfloat16):
+def get_h800_peak_tflops(dtype=torch.bfloat16):
     if dtype in (torch.float16, torch.bfloat16):
-        return 312.0
+        return 989.0  # H800 BF16/FP16 Tensor Core peak
     elif dtype == torch.float32:
-        return 19.5
+        return 67.0   # H800 FP32
     else:
-        return 312.0
+        return 989.0
 
 
 def attention_flops(B, H, N, D, is_training=False):
@@ -50,7 +50,7 @@ def measure_mfu(fn, B, H, N, D, is_training=False,
     flops = attention_flops(B, H, N, D, is_training)
     tflops = flops / elapsed_s / 1e12
 
-    peak = get_a100_peak_tflops(dtype)
+    peak = get_h800_peak_tflops(dtype)
     mfu = tflops / peak * 100.0
 
     return {
