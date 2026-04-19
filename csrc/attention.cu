@@ -8,28 +8,28 @@
 #include <ATen/cuda/CUDAContext.h>
 
 // ================================================================
-// Round 8: wmma m16n16k16 BF16, TILE_Q=32 + TILE_KV=32
+// Round 5: wmma m16n16k16 BF16, TILE_KV=32 (was 64)
 //
-// Key idea: TILE_Q=32 (2 warps, 64 threads per block):
-//   smem: Q[32][66]+K[32][66]+V[32][66]+S[32][34] = 14.5KB
-//   threads: 64 per block
-//   With 100 regs: floor(65536/(64*100))=10 blocks/SM = 40 warps = 62.5% occ!
+// Smaller KV tile reduces live WMMA accumulator registers:
+//   qk_acc[4] → qk_acc[2] (TILE_KV/16 n-tiles)
+//   smem: Q[64][66]+K[32][66]+V[32][66]+S[64][66] ≈ 22KB
+//   Allows more blocks/SM with same register budget.
 //
-// Trade-off: 2× more blocks in grid (Q-dim), but much better occupancy.
+// No __launch_bounds__: let compiler freely optimize.
 // ================================================================
 
-static constexpr int TILE_Q8  = 32;   // reduced from 64
-static constexpr int TILE_KV8 = 32;
-static constexpr int HD8      = 64;
-static constexpr int HD_PAD8  = HD8 + 2;        // 66
-static constexpr int KV_PAD8  = TILE_KV8 + 2;   // 34
-static constexpr int BLK8     = 64;              // 2 warps
+static constexpr int TILE_Q5  = 64;
+static constexpr int TILE_KV5 = 48;   // reduced from 64
+static constexpr int HD5      = 64;
+static constexpr int HD_PAD5  = HD5 + 2;      // 66
+static constexpr int KV_PAD5  = TILE_KV5 + 2; // 34
+static constexpr int BLK5     = 128;
 
 #ifndef CEIL_DIV
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 #endif
 
-__global__ void flash_attn_bf16_mma8_kernel(
+__global__ void flash_attn_bf16_mma5_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
@@ -43,68 +43,70 @@ __global__ void flash_attn_bf16_mma8_kernel(
     const int lane    = threadIdx.x % 32;
     const int i_h     = blockIdx.y;
     const int i_b     = blockIdx.z;
-    const int q_start = blockIdx.x * TILE_Q8;
+    const int q_start = blockIdx.x * TILE_Q5;
 
-    const long stride_H = (long)N  * HD8;
-    const long stride_B = (long)H * N * HD8;
+    const long stride_H = (long)N  * HD5;
+    const long stride_B = (long)H * N * HD5;
 
     const __nv_bfloat16* q_ptr = Q + i_b * stride_B + i_h * stride_H;
     const __nv_bfloat16* k_ptr = K + i_b * stride_B + i_h * stride_H;
     const __nv_bfloat16* v_ptr = V + i_b * stride_B + i_h * stride_H;
           __nv_bfloat16* o_ptr = O + i_b * stride_B + i_h * stride_H;
 
-    // Smem ≈ 14.5KB → allows ~10 blocks/SM with 100 regs
-    __shared__ __nv_bfloat16 Q_smem[TILE_Q8 ][HD_PAD8];   // [32][66]
-    __shared__ __nv_bfloat16 K_smem[TILE_KV8][HD_PAD8];   // [32][66]
-    __shared__ __nv_bfloat16 V_smem[TILE_KV8][HD_PAD8];   // [32][66]
-    __shared__ __nv_bfloat16 S_smem[TILE_Q8 ][KV_PAD8];   // [32][34]
+    // Smem ≈ 22KB (vs 33KB in Round 2-4)
+    __shared__ __nv_bfloat16 Q_smem[TILE_Q5 ][HD_PAD5];   // [64][66]
+    __shared__ __nv_bfloat16 K_smem[TILE_KV5][HD_PAD5];   // [32][66]
+    __shared__ __nv_bfloat16 V_smem[TILE_KV5][HD_PAD5];   // [32][66]
+    __shared__ __nv_bfloat16 S_smem[TILE_Q5 ][KV_PAD5];   // [64][34]
 
-    // 2 warps → each warp handles 16 Q rows (warp 0: rows 0-15, warp 1: rows 16-31)
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc[4];
     for (int j = 0; j < 4; j++) wmma::fill_fragment(o_acc[j], 0.f);
 
     float m0 = -FLT_MAX, m1 = -FLT_MAX;
     float l0 = 0.f,      l1 = 0.f;
 
-    for (int idx = threadIdx.x; idx < TILE_Q8 * HD8; idx += BLK8) {
-        const int r = idx / HD8, c = idx % HD8;
+    for (int idx = threadIdx.x; idx < TILE_Q5 * HD5; idx += BLK5) {
+        const int r = idx / HD5, c = idx % HD5;
         const int g = q_start + r;
-        Q_smem[r][c] = (g < N) ? q_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
+        Q_smem[r][c] = (g < N) ? q_ptr[(long)g * HD5 + c] : __float2bfloat16(0.f);
     }
     __syncthreads();
 
-    const int num_kv = CEIL_DIV(N, TILE_KV8);
+    const int num_kv = CEIL_DIV(N, TILE_KV5);
     for (int kv = 0; kv < num_kv; ++kv) {
-        const int kv_start = kv * TILE_KV8;
-        const int kv_len   = min(TILE_KV8, N - kv_start);
+        const int kv_start = kv * TILE_KV5;
+        const int kv_len   = min(TILE_KV5, N - kv_start);
 
-        for (int idx = threadIdx.x; idx < TILE_KV8 * HD8; idx += BLK8) {
-            const int r = idx / HD8, c = idx % HD8;
+        for (int idx = threadIdx.x; idx < TILE_KV5 * HD5; idx += BLK5) {
+            const int r = idx / HD5, c = idx % HD5;
             const int g = kv_start + r;
-            K_smem[r][c] = (r < kv_len) ? k_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
-            V_smem[r][c] = (r < kv_len) ? v_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
+            K_smem[r][c] = (r < kv_len) ? k_ptr[(long)g * HD5 + c] : __float2bfloat16(0.f);
+            V_smem[r][c] = (r < kv_len) ? v_ptr[(long)g * HD5 + c] : __float2bfloat16(0.f);
         }
         __syncthreads();
 
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> qk_acc[2];
-        for (int j = 0; j < 2; j++) wmma::fill_fragment(qk_acc[j], 0.f);
+        // ---- QK^T: TILE_KV5/16 = 2 n-tiles (was 4) ----
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> qk_acc[3]; // was [4]
+        #pragma unroll
+        for (int j = 0; j < 3; j++) wmma::fill_fragment(qk_acc[j], 0.f);
 
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>    a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>    bk_frag;
+        #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
-            wmma::load_matrix_sync(a_frag, &Q_smem[warp_id * 16][kt * 16], HD_PAD8);
-            for (int j = 0; j < 2; ++j) {
-                wmma::load_matrix_sync(bk_frag, &K_smem[j * 16][kt * 16], HD_PAD8);
+            wmma::load_matrix_sync(a_frag, &Q_smem[warp_id * 16][kt * 16], HD_PAD5);
+            for (int j = 0; j < 3; ++j) {  // 3 n-tiles for KV=48
+                wmma::load_matrix_sync(bk_frag, &K_smem[j * 16][kt * 16], HD_PAD5);
                 wmma::mma_sync(qk_acc[j], a_frag, bk_frag, qk_acc[j]);
             }
         }
 
-        for (int j = 0; j < 2; ++j)
+        for (int j = 0; j < 3; ++j)
             for (int i = 0; i < 8; ++i)
                 qk_acc[j].x[i] *= scale;
 
-        if (kv_len < TILE_KV8) {
-            for (int j = 0; j < 2; ++j) {
+        if (kv_len < TILE_KV5) {
+            for (int j = 0; j < 3; ++j) {
                 const int c0 = j * 16 + 2 * (lane % 4);
                 if (c0   >= kv_len) { qk_acc[j].x[0]=-FLT_MAX; qk_acc[j].x[2]=-FLT_MAX; }
                 if (c0+1 >= kv_len) { qk_acc[j].x[1]=-FLT_MAX; qk_acc[j].x[3]=-FLT_MAX; }
@@ -114,7 +116,7 @@ __global__ void flash_attn_bf16_mma8_kernel(
         }
 
         float tile_max0 = -FLT_MAX, tile_max1 = -FLT_MAX;
-        for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < 3; ++j) {
             tile_max0 = fmaxf(tile_max0, fmaxf(fmaxf(qk_acc[j].x[0], qk_acc[j].x[1]),
                                                 fmaxf(qk_acc[j].x[4], qk_acc[j].x[5])));
             tile_max1 = fmaxf(tile_max1, fmaxf(fmaxf(qk_acc[j].x[2], qk_acc[j].x[3]),
@@ -142,7 +144,7 @@ __global__ void flash_attn_bf16_mma8_kernel(
         float sum0 = 0.f, sum1 = 0.f;
         const int wr0 = warp_id * 16 + lane / 4;
         const int wr1 = wr0 + 8;
-        for (int j = 0; j < 2; ++j) {
+        for (int j = 0; j < 3; ++j) {  // 3 n-tiles for KV=48
             const int c0 = j * 16 + 2 * (lane % 4);
             const float p0 = __expf(qk_acc[j].x[0] - m0);
             const float p1 = __expf(qk_acc[j].x[1] - m0);
@@ -169,12 +171,13 @@ __global__ void flash_attn_bf16_mma8_kernel(
         sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
         l0 += sum0; l1 += sum1;
 
+        // ---- AV: TILE_KV5/16 = 2 k-tiles ----
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> s_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bv_frag;
-        for (int kt = 0; kt < 2; ++kt) {
-            wmma::load_matrix_sync(s_frag, &S_smem[warp_id * 16][kt * 16], KV_PAD8);
+        for (int kt = 0; kt < 3; ++kt) {  // 3 k-tiles for KV=48
+            wmma::load_matrix_sync(s_frag, &S_smem[warp_id * 16][kt * 16], KV_PAD5);
             for (int j = 0; j < 4; ++j) {
-                wmma::load_matrix_sync(bv_frag, &V_smem[kt * 16][j * 16], HD_PAD8);
+                wmma::load_matrix_sync(bv_frag, &V_smem[kt * 16][j * 16], HD_PAD5);
                 wmma::mma_sync(o_acc[j], s_frag, bv_frag, o_acc[j]);
             }
         }
@@ -187,18 +190,18 @@ __global__ void flash_attn_bf16_mma8_kernel(
     for (int j = 0; j < 4; ++j) {
         const int row0 = q_start + warp_id * 16 + lane / 4;
         const int row1 = row0 + 8;
-        const int cb   = j * 16 + 2 * (lane % 4);
+        const int c0   = j * 16 + 2 * (lane % 4);
         if (row0 < N) {
-            o_ptr[(long)row0 * HD8 + cb    ] = __float2bfloat16(o_acc[j].x[0] * inv_l0);
-            o_ptr[(long)row0 * HD8 + cb + 1] = __float2bfloat16(o_acc[j].x[1] * inv_l0);
-            o_ptr[(long)row0 * HD8 + cb + 8] = __float2bfloat16(o_acc[j].x[4] * inv_l0);
-            o_ptr[(long)row0 * HD8 + cb + 9] = __float2bfloat16(o_acc[j].x[5] * inv_l0);
+            o_ptr[(long)row0 * HD5 + c0    ] = __float2bfloat16(o_acc[j].x[0] * inv_l0);
+            o_ptr[(long)row0 * HD5 + c0 + 1] = __float2bfloat16(o_acc[j].x[1] * inv_l0);
+            o_ptr[(long)row0 * HD5 + c0 + 8] = __float2bfloat16(o_acc[j].x[4] * inv_l0);
+            o_ptr[(long)row0 * HD5 + c0 + 9] = __float2bfloat16(o_acc[j].x[5] * inv_l0);
         }
         if (row1 < N) {
-            o_ptr[(long)row1 * HD8 + cb    ] = __float2bfloat16(o_acc[j].x[2] * inv_l1);
-            o_ptr[(long)row1 * HD8 + cb + 1] = __float2bfloat16(o_acc[j].x[3] * inv_l1);
-            o_ptr[(long)row1 * HD8 + cb + 8] = __float2bfloat16(o_acc[j].x[6] * inv_l1);
-            o_ptr[(long)row1 * HD8 + cb + 9] = __float2bfloat16(o_acc[j].x[7] * inv_l1);
+            o_ptr[(long)row1 * HD5 + c0    ] = __float2bfloat16(o_acc[j].x[2] * inv_l1);
+            o_ptr[(long)row1 * HD5 + c0 + 1] = __float2bfloat16(o_acc[j].x[3] * inv_l1);
+            o_ptr[(long)row1 * HD5 + c0 + 8] = __float2bfloat16(o_acc[j].x[6] * inv_l1);
+            o_ptr[(long)row1 * HD5 + c0 + 9] = __float2bfloat16(o_acc[j].x[7] * inv_l1);
         }
     }
 
@@ -213,10 +216,10 @@ __global__ void flash_attn_bf16_mma8_kernel(
 
 void attention_fwd_bf16(const AttentionParams& p, cudaStream_t stream)
 {
-    TORCH_CHECK(p.head_dim == HD8,
-                "head_dim must be ", HD8, " for this kernel, got ", p.head_dim);
-    const dim3 grid(CEIL_DIV(p.seq_len, TILE_Q8), p.num_heads, p.batch_size);
-    flash_attn_bf16_mma8_kernel<<<grid, dim3(BLK8), 0, stream>>>(
+    TORCH_CHECK(p.head_dim == HD5,
+                "head_dim must be ", HD5, " for this kernel, got ", p.head_dim);
+    const dim3 grid(CEIL_DIV(p.seq_len, TILE_Q5), p.num_heads, p.batch_size);
+    flash_attn_bf16_mma5_kernel<<<grid, dim3(BLK5), 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(p.q),
         reinterpret_cast<const __nv_bfloat16*>(p.k),
         reinterpret_cast<const __nv_bfloat16*>(p.v),
@@ -256,5 +259,5 @@ void attn_forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &attn_forward, "Dense attention BF16 (Round 8: TILE_Q=32 TILE_KV=32 2warps)");
+    m.def("forward", &attn_forward, "Dense attention BF16 (Round 5: TILE_KV=32)");
 }
