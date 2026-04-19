@@ -12,7 +12,7 @@ nvcc_flags = [
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_BFLOAT16_OPERATORS__",
     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_90a,code=sm_90a",
 ]
 
 cxx_flags = ["-O3", "-std=c++17"]
