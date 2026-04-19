@@ -58,7 +58,7 @@ class AttentionFunction(Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        if HAS_CUDA_EXT:
+        if HAS_CUDA_EXT and hasattr(attn_cuda, 'backward'):
             attn_cuda.backward(dout, q, k, v, out, lse, dq, dk, dv, scale)
         else:
             scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
