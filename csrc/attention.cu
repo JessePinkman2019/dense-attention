@@ -8,27 +8,28 @@
 #include <ATen/cuda/CUDAContext.h>
 
 // ================================================================
-// Round 7: wmma m16n16k16 BF16, TILE_KV=32 + double-buffer cp.async
+// Round 8: wmma m16n16k16 BF16, TILE_Q=32 + TILE_KV=32
 //
-// Double buffer K/V to overlap HBM loading with compute.
-// Smem: Q[64][66]+K[2][32][66]+V[2][32][66]+S[64][34] = 29KB < 48KB
-// Enables: load KV[kv+1] while computing QK^T+softmax+AV for KV[kv]
-// Expected improvement: ~15-25% further speedup beyond Round 5 (0.491ms)
+// Key idea: TILE_Q=32 (2 warps, 64 threads per block):
+//   smem: Q[32][66]+K[32][66]+V[32][66]+S[32][34] = 14.5KB
+//   threads: 64 per block
+//   With 100 regs: floor(65536/(64*100))=10 blocks/SM = 40 warps = 62.5% occ!
+//
+// Trade-off: 2× more blocks in grid (Q-dim), but much better occupancy.
 // ================================================================
 
-static constexpr int TILE_Q7  = 64;
-static constexpr int TILE_KV7 = 32;
-static constexpr int HD7      = 64;
-static constexpr int HD_PAD7  = HD7 + 2;        // 66
-static constexpr int HD_B7    = HD7;              // 64 (128B rows for cp.async 16B alignment)
-static constexpr int KV_PAD7  = TILE_KV7 + 2;   // 34
-static constexpr int BLK7     = 128;
+static constexpr int TILE_Q8  = 32;   // reduced from 64
+static constexpr int TILE_KV8 = 32;
+static constexpr int HD8      = 64;
+static constexpr int HD_PAD8  = HD8 + 2;        // 66
+static constexpr int KV_PAD8  = TILE_KV8 + 2;   // 34
+static constexpr int BLK8     = 64;              // 2 warps
 
 #ifndef CEIL_DIV
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 #endif
 
-__global__ void flash_attn_bf16_mma7_kernel(
+__global__ void flash_attn_bf16_mma8_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
@@ -42,85 +43,58 @@ __global__ void flash_attn_bf16_mma7_kernel(
     const int lane    = threadIdx.x % 32;
     const int i_h     = blockIdx.y;
     const int i_b     = blockIdx.z;
-    const int q_start = blockIdx.x * TILE_Q7;
+    const int q_start = blockIdx.x * TILE_Q8;
 
-    const long stride_H = (long)N  * HD7;
-    const long stride_B = (long)H * N * HD7;
+    const long stride_H = (long)N  * HD8;
+    const long stride_B = (long)H * N * HD8;
 
     const __nv_bfloat16* q_ptr = Q + i_b * stride_B + i_h * stride_H;
     const __nv_bfloat16* k_ptr = K + i_b * stride_B + i_h * stride_H;
     const __nv_bfloat16* v_ptr = V + i_b * stride_B + i_h * stride_H;
           __nv_bfloat16* o_ptr = O + i_b * stride_B + i_h * stride_H;
 
-    // Double-buffer smem: 29KB total < 48KB limit
-    __shared__ __nv_bfloat16 Q_smem[TILE_Q7 ][HD_PAD7];     // [64][66]
-    __shared__ __nv_bfloat16 K_smem[2][TILE_KV7][HD_B7];   // [2][32][64] 128B/row
-    __shared__ __nv_bfloat16 V_smem[2][TILE_KV7][HD_B7];   // [2][32][64] 128B/row
-    __shared__ __nv_bfloat16 S_smem[TILE_Q7 ][KV_PAD7];     // [64][34]
+    // Smem ≈ 14.5KB → allows ~10 blocks/SM with 100 regs
+    __shared__ __nv_bfloat16 Q_smem[TILE_Q8 ][HD_PAD8];   // [32][66]
+    __shared__ __nv_bfloat16 K_smem[TILE_KV8][HD_PAD8];   // [32][66]
+    __shared__ __nv_bfloat16 V_smem[TILE_KV8][HD_PAD8];   // [32][66]
+    __shared__ __nv_bfloat16 S_smem[TILE_Q8 ][KV_PAD8];   // [32][34]
 
+    // 2 warps → each warp handles 16 Q rows (warp 0: rows 0-15, warp 1: rows 16-31)
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_acc[4];
     for (int j = 0; j < 4; j++) wmma::fill_fragment(o_acc[j], 0.f);
 
     float m0 = -FLT_MAX, m1 = -FLT_MAX;
     float l0 = 0.f,      l1 = 0.f;
 
-    // Load Q tile (synchronous)
-    for (int idx = threadIdx.x; idx < TILE_Q7 * HD7; idx += BLK7) {
-        const int r = idx / HD7, c = idx % HD7;
+    for (int idx = threadIdx.x; idx < TILE_Q8 * HD8; idx += BLK8) {
+        const int r = idx / HD8, c = idx % HD8;
         const int g = q_start + r;
-        Q_smem[r][c] = (g < N) ? q_ptr[(long)g * HD7 + c] : __float2bfloat16(0.f);
+        Q_smem[r][c] = (g < N) ? q_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
     }
-
-    // Helper lambda for cp.async load of one KV tile into buf
-    // buf: smem buffer index, ns: global start row, nlen: valid rows
-    auto load_kv_async = [&](int buf, int ns) {
-        // TILE_KV7*HD7/8 = 32*64/8 = 256 calls, 2 calls/thread for 128 threads
-        for (int idx = threadIdx.x; idx < (TILE_KV7 * HD7) / 8; idx += BLK7) {
-            const int r = (idx * 8) / HD7, c = (idx * 8) % HD7;
-            const int g = ns + r;
-            if (g < N) {
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : :
-                    "r"((uint32_t)__cvta_generic_to_shared(&K_smem[buf][r][c])),
-                    "l"(&k_ptr[(long)g * HD7 + c]));
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : :
-                    "r"((uint32_t)__cvta_generic_to_shared(&V_smem[buf][r][c])),
-                    "l"(&v_ptr[(long)g * HD7 + c]));
-            } else {
-                *reinterpret_cast<uint4*>(&K_smem[buf][r][c]) = make_uint4(0,0,0,0);
-                *reinterpret_cast<uint4*>(&V_smem[buf][r][c]) = make_uint4(0,0,0,0);
-            }
-        }
-    };
-
-    // Pre-load KV tile 0
-    load_kv_async(0, 0);
-    asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
 
-    const int num_kv = CEIL_DIV(N, TILE_KV7);
+    const int num_kv = CEIL_DIV(N, TILE_KV8);
     for (int kv = 0; kv < num_kv; ++kv) {
-        const int cur_buf  = kv & 1;
-        const int nxt_buf  = 1 - cur_buf;
-        const int kv_start = kv * TILE_KV7;
-        const int kv_len   = min(TILE_KV7, N - kv_start);
+        const int kv_start = kv * TILE_KV8;
+        const int kv_len   = min(TILE_KV8, N - kv_start);
 
-        // Start loading next KV tile (overlaps with QK^T + softmax)
-        if (kv + 1 < num_kv) {
-            load_kv_async(nxt_buf, (kv + 1) * TILE_KV7);
-            asm volatile("cp.async.commit_group;\n");
+        for (int idx = threadIdx.x; idx < TILE_KV8 * HD8; idx += BLK8) {
+            const int r = idx / HD8, c = idx % HD8;
+            const int g = kv_start + r;
+            K_smem[r][c] = (r < kv_len) ? k_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
+            V_smem[r][c] = (r < kv_len) ? v_ptr[(long)g * HD8 + c] : __float2bfloat16(0.f);
         }
+        __syncthreads();
 
-        // ---- QK^T (uses cur_buf K) ----
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> qk_acc[2];
         for (int j = 0; j < 2; j++) wmma::fill_fragment(qk_acc[j], 0.f);
 
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>    a_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>    bk_frag;
         for (int kt = 0; kt < 4; ++kt) {
-            wmma::load_matrix_sync(a_frag, &Q_smem[warp_id * 16][kt * 16], HD_PAD7);
+            wmma::load_matrix_sync(a_frag, &Q_smem[warp_id * 16][kt * 16], HD_PAD8);
             for (int j = 0; j < 2; ++j) {
-                wmma::load_matrix_sync(bk_frag, &K_smem[cur_buf][j * 16][kt * 16], HD_B7);
+                wmma::load_matrix_sync(bk_frag, &K_smem[j * 16][kt * 16], HD_PAD8);
                 wmma::mma_sync(qk_acc[j], a_frag, bk_frag, qk_acc[j]);
             }
         }
@@ -129,7 +103,7 @@ __global__ void flash_attn_bf16_mma7_kernel(
             for (int i = 0; i < 8; ++i)
                 qk_acc[j].x[i] *= scale;
 
-        if (kv_len < TILE_KV7) {
+        if (kv_len < TILE_KV8) {
             for (int j = 0; j < 2; ++j) {
                 const int c0 = j * 16 + 2 * (lane % 4);
                 if (c0   >= kv_len) { qk_acc[j].x[0]=-FLT_MAX; qk_acc[j].x[2]=-FLT_MAX; }
@@ -139,7 +113,6 @@ __global__ void flash_attn_bf16_mma7_kernel(
             }
         }
 
-        // Online softmax
         float tile_max0 = -FLT_MAX, tile_max1 = -FLT_MAX;
         for (int j = 0; j < 2; ++j) {
             tile_max0 = fmaxf(tile_max0, fmaxf(fmaxf(qk_acc[j].x[0], qk_acc[j].x[1]),
@@ -196,22 +169,12 @@ __global__ void flash_attn_bf16_mma7_kernel(
         sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
         l0 += sum0; l1 += sum1;
 
-        // Wait for next KV tile before AV (safe: S_smem is written and ready)
-        // AND to ensure nxt_buf V data is ready for AV of CURRENT buf
-        // → AV reads from cur_buf V, which is already synced
-        // Wait for nxt_buf only if it was requested
-        if (kv + 1 < num_kv) {
-            asm volatile("cp.async.wait_group 0;\n");
-        }
-        __syncthreads();
-
-        // ---- AV (uses cur_buf V) ----
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> s_frag;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bv_frag;
         for (int kt = 0; kt < 2; ++kt) {
-            wmma::load_matrix_sync(s_frag, &S_smem[warp_id * 16][kt * 16], KV_PAD7);
+            wmma::load_matrix_sync(s_frag, &S_smem[warp_id * 16][kt * 16], KV_PAD8);
             for (int j = 0; j < 4; ++j) {
-                wmma::load_matrix_sync(bv_frag, &V_smem[cur_buf][kt * 16][j * 16], HD_B7);
+                wmma::load_matrix_sync(bv_frag, &V_smem[kt * 16][j * 16], HD_PAD8);
                 wmma::mma_sync(o_acc[j], s_frag, bv_frag, o_acc[j]);
             }
         }
@@ -226,16 +189,16 @@ __global__ void flash_attn_bf16_mma7_kernel(
         const int row1 = row0 + 8;
         const int cb   = j * 16 + 2 * (lane % 4);
         if (row0 < N) {
-            o_ptr[(long)row0 * HD7 + cb    ] = __float2bfloat16(o_acc[j].x[0] * inv_l0);
-            o_ptr[(long)row0 * HD7 + cb + 1] = __float2bfloat16(o_acc[j].x[1] * inv_l0);
-            o_ptr[(long)row0 * HD7 + cb + 8] = __float2bfloat16(o_acc[j].x[4] * inv_l0);
-            o_ptr[(long)row0 * HD7 + cb + 9] = __float2bfloat16(o_acc[j].x[5] * inv_l0);
+            o_ptr[(long)row0 * HD8 + cb    ] = __float2bfloat16(o_acc[j].x[0] * inv_l0);
+            o_ptr[(long)row0 * HD8 + cb + 1] = __float2bfloat16(o_acc[j].x[1] * inv_l0);
+            o_ptr[(long)row0 * HD8 + cb + 8] = __float2bfloat16(o_acc[j].x[4] * inv_l0);
+            o_ptr[(long)row0 * HD8 + cb + 9] = __float2bfloat16(o_acc[j].x[5] * inv_l0);
         }
         if (row1 < N) {
-            o_ptr[(long)row1 * HD7 + cb    ] = __float2bfloat16(o_acc[j].x[2] * inv_l1);
-            o_ptr[(long)row1 * HD7 + cb + 1] = __float2bfloat16(o_acc[j].x[3] * inv_l1);
-            o_ptr[(long)row1 * HD7 + cb + 8] = __float2bfloat16(o_acc[j].x[6] * inv_l1);
-            o_ptr[(long)row1 * HD7 + cb + 9] = __float2bfloat16(o_acc[j].x[7] * inv_l1);
+            o_ptr[(long)row1 * HD8 + cb    ] = __float2bfloat16(o_acc[j].x[2] * inv_l1);
+            o_ptr[(long)row1 * HD8 + cb + 1] = __float2bfloat16(o_acc[j].x[3] * inv_l1);
+            o_ptr[(long)row1 * HD8 + cb + 8] = __float2bfloat16(o_acc[j].x[6] * inv_l1);
+            o_ptr[(long)row1 * HD8 + cb + 9] = __float2bfloat16(o_acc[j].x[7] * inv_l1);
         }
     }
 
@@ -250,10 +213,10 @@ __global__ void flash_attn_bf16_mma7_kernel(
 
 void attention_fwd_bf16(const AttentionParams& p, cudaStream_t stream)
 {
-    TORCH_CHECK(p.head_dim == HD7,
-                "head_dim must be ", HD7, " for this kernel, got ", p.head_dim);
-    const dim3 grid(CEIL_DIV(p.seq_len, TILE_Q7), p.num_heads, p.batch_size);
-    flash_attn_bf16_mma7_kernel<<<grid, dim3(BLK7), 0, stream>>>(
+    TORCH_CHECK(p.head_dim == HD8,
+                "head_dim must be ", HD8, " for this kernel, got ", p.head_dim);
+    const dim3 grid(CEIL_DIV(p.seq_len, TILE_Q8), p.num_heads, p.batch_size);
+    flash_attn_bf16_mma8_kernel<<<grid, dim3(BLK8), 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(p.q),
         reinterpret_cast<const __nv_bfloat16*>(p.k),
         reinterpret_cast<const __nv_bfloat16*>(p.v),
@@ -293,5 +256,5 @@ void attn_forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &attn_forward, "Dense attention BF16 (Round 7: TILE_KV=32 + double-buffer cp.async)");
+    m.def("forward", &attn_forward, "Dense attention BF16 (Round 8: TILE_Q=32 TILE_KV=32 2warps)");
 }
