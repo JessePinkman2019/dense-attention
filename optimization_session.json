@@ -1,0 +1,283 @@
+[
+  {
+    "round": 1,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T13:01:18.197004",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 2.637,
+        "N1024_B64": 19.91
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.118,
+        "N1024_B64": 0.027
+      },
+      "ncu_metrics": {
+        "occupancy_pct": 20.89,
+        "compute_throughput_pct": 89.65,
+        "registers_per_thread": 128,
+        "smem_kb": 33.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "L1_TEX_throughput_93pct_scalar_no_tensor_core",
+      "notes": "Round 1 scalar baseline. M0 PASS (correctness). M1 FAIL (19.9ms >> 8.442ms target). L1/TEX=93.9% saturated—scalar FP32 arithmetic density too low. Need Tensor Core mma to improve compute/smem ratio."
+    }
+  },
+  {
+    "round": 2,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T13:28:18.788486",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.574,
+        "N1024_B64": 4.086
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.5418118466898955,
+        "N1024_B64": 0.13069016152716592
+      },
+      "ncu_metrics": {
+        "occupancy_pct": 17.55,
+        "compute_throughput_pct": 32.31,
+        "registers_per_thread": 168,
+        "smem_kb": 33.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "register_pressure_168_per_thread_wmma_fragments_limit_occupancy_to_17pct",
+      "notes": "Round 2 WMMA m16n16k16 BF16. M1 PASS (B64 4.086ms < 8.442ms). M2 FAIL (B8 0.574ms >> 0.704ms target). Root cause: wmma accumulators consume 168 reg/thread vs FlashInfer 128. Need WGMMA or tile reduction to cut registers. Bug fixed: block size was 64 instead of 128 threads."
+    }
+  },
+  {
+    "round": 3,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T14:42:51.727402",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.573,
+        "N1024_B64": 4.065
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.5427574171029669,
+        "N1024_B64": 0.13136531365313653
+      },
+      "ncu_metrics": {
+        "occupancy_pct": 17.56,
+        "compute_throughput_pct": 32.34,
+        "registers_per_thread": 168,
+        "smem_kb": 33.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "wmma_fragment_168reg_per_thread_launch_bounds_ineffective",
+      "notes": "Round 3: __launch_bounds__(128,3) no effect (compiler already using 168 regs for wmma fragments). WGMMA ss-form extensively debugged: ss-form A smem descriptor gives wrong results due to implementation-specific A-matrix hardware layout. WGMMA rs-form (A from registers) is the correct path for Round 4: register A layout = WMMA m16n16k16 A fragment layout (known-correct from Round 2), B from smem descriptor. Critical WGMMA layout discovery: thread 0 (warp 0, lane 0) covers n-cols {1,17,3,19} not {0,1,8,9} as assumed from WMMA."
+    }
+  },
+  {
+    "round": 4,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T15:54:59.958167",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.58
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.5362068965517242
+      },
+      "ncu_metrics": {
+        "occupancy_pct": 17.5,
+        "compute_throughput_pct": 32.0,
+        "registers_per_thread": 168,
+        "smem_kb": 32.5,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "wmma_fragment_register_pressure_168_per_thread",
+      "notes": "WGMMA rs-form fundamental issue: output accumulators span 9 rows per thread (r0..r1 with duplicates), incompatible with 2-row online softmax tracking. WGMMA ss-form: ss-form k-advance requires 128B swizzle in smem + kt*2 advance per k-slice. Round 5 plan: WGMMA ss + 128B swizzle + correct k-advances. BF16 precision issue caused false confusion in test analysis (2056 rounds to 2048 in BF16)."
+    }
+  },
+  {
+    "round": 5,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:04:41.989496",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.491
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.6334012219959266
+      },
+      "ncu_metrics": {
+        "occupancy_pct": 23.12,
+        "compute_throughput_pct": 38.38,
+        "registers_per_thread": 100,
+        "smem_kb": 22.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "wmma_register_pressure_still_high_need_further_tile_reduction_or_wgmma",
+      "notes": "TILE_KV=32 breakthrough: registers 168→100 (40% reduction!), occupancy 17.5%→23.1% (+32%), compute 32%→38.4%. Latency 0.574→0.491ms (17% improvement). Round 6 plan: try TILE_KV=16 (qk_acc[1]) to further reduce registers toward 64/thread target for 40% occupancy."
+    }
+  },
+  {
+    "round": 6,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:07:54.086183",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.566
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.549469964664311
+      },
+      "ncu_metrics": {
+        "occupancy_pct": null,
+        "compute_throughput_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": 19.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "kv_loop_overhead_64_iterations_too_expensive",
+      "notes": "TILE_KV=16 regression: 64 iterations (vs 32 for Round 5) loop overhead dominates register savings. Sweet spot is TILE_KV=32 (Round 5, 0.491ms). Round 7 plan: TILE_KV=32 + double-buffer cp.async (smem 22KB→29KB < 48KB limit) to overlap K/V loading with compute."
+    }
+  },
+  {
+    "round": 7,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:15:26.537892",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.601
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.5174708818635607
+      },
+      "ncu_metrics": {},
+      "primary_bottleneck": "regression",
+      "notes": "Round 7: regression to 0.601ms"
+    }
+  },
+  {
+    "round": 8,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:15:26.537912",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.621
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.500805152979066
+      },
+      "ncu_metrics": {},
+      "primary_bottleneck": "regression",
+      "notes": "Round 8: regression to 0.621ms"
+    }
+  },
+  {
+    "round": 9,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:22:52.470724",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.473
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.6575052854122622
+      },
+      "ncu_metrics": {
+        "occupancy_pct": null,
+        "compute_throughput_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": 27.0,
+        "eligible_warps_per_scheduler": 0.0
+      },
+      "primary_bottleneck": "wmma_register_pressure_approaching_ceiling",
+      "notes": "TILE_KV=48 (3 n-tiles, qk_acc[3]): 0.473ms best so far. Grid search: 16→0.566, 32→0.491, 48→0.473, 64→0.574. 48 is optimal. 22 KV iterations provides best balance between iteration overhead and register pressure. Further improvement needs WGMMA (requires proper reference implementation)."
+    }
+  },
+  {
+    "round": 10,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T16:27:10.157941",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.472
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 0.6588983050847458
+      },
+      "ncu_metrics": {
+        "occupancy_pct": null,
+        "compute_throughput_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": 27.0
+      },
+      "primary_bottleneck": "wmma_ceiling_reached_need_wgmma",
+      "notes": "Round 10 final: TILE_KV=48 (no launch_bounds). 0.472ms. WMMA ceiling. Tile search exhausted: 16→0.566, 32→0.491, 48→0.472(best), 64→0.574. Double-buffer cp.async overhead too high. TILE_Q=32 overhead too high. Plateau strategy: need completely different approach (WGMMA+FA3 architecture). Final WMMA result: 0.472ms = M2 PASS (< 0.704ms), M3 FAIL (needs < 0.311ms)."
+    }
+  },
+  {
+    "round": 11,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T17:15:03.117352",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.434
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 1.3954983922829582
+      },
+      "ncu_metrics": {
+        "smem_kb": 32.0
+      },
+      "primary_bottleneck": "scalar_smem_loads_no_pipelining",
+      "notes": "Round 11: WGMMA m64n64k16 BF16 + 128B swizzle smem. 0.434ms (vs WMMA 0.472ms = +8.9%, vs FlashInfer 0.311ms = -28%). Single warpgroup, 128 threads. Sequential K/V loading with scalar ld.global. Next: vectorized 128-bit loads (cp.async) + double-buffer pipelining to hide load latency."
+    }
+  },
+  {
+    "round": 12,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T22:12:05.599072",
+    "factual_analysis": {
+      "compile_success": false,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "primary_bottleneck": "wgmma_descriptor_requires_tma",
+      "notes": "Round 12 WGMMA descriptor diagnosis (exhaustive):\nDEAD PATHS (do not retry):\n1. B128 MN-major manual swizzle (r&7): reads k=0,16,32,48 only (sparse). Root: WGMMA B128 canonical requires K_step>=64 BF16 for valid layout; K_step=16 uses stride<1,0>=8 meaning K-elements are 128 bytes=1 row apart in smem, completely wrong for row-major [N][K] storage.\n2. B128 MN-major manual swizzle (r>>3): ALSO wrong - N-group mapping broken (all groups converge to rows 7-9 instead of 0,8,16,...,56). Verified empirically with B[n][k]=n test.\n3. kNONE (INTERLEAVE) sbo=64: correct N-group mapping BUT reads k=0,8,16,...,56 only (8 sparse positions), k-advance via address patching has no effect. Root: INTERLEAVE format requires special interleaved data layout.\n4. transB=0 K-major: all j-groups give same value (2016) for B[k][n]=n, N-groups dont differentiate.\n5. All (layout_type, SBO, LBO, swizzle) combos: tested 0..256 SBO x 4 layout types - NONE correct.\nROOT CAUSE: WGMMA B128 requires TMA (cuTensorMapEncodeTiled) to load smem with correct hardware-applied B128 swizzle. Manual stores (even with correct formula) produce different layout than TMA. Confirmed by deep_gemm which uses TMA+B128+make_smem_desc(ptr,1,0,1024) successfully.\nSOLUTION: Use TMA for K and V loading. Use rs-form WGMMA (A from registers) to avoid A-descriptor issue for Q and S. Only K and V need TMA."
+    }
+  },
+  {
+    "round": 13,
+    "brain": "evaluator",
+    "timestamp": "2026-04-19T23:41:35.310957",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "primary_bottleneck": "wgmma_b128_layout_incompatible_with_standard_smem",
+      "notes": "Round 13 TMA+WGMMA exhaustive diagnosis:\nBREAKTHROUGHS:\n1. TMA now works correctly (after discovering correct PTX protocol):\n   - Must use mbarrier.arrive.expect_tx (BOTH arrives count AND expects TX) NOT separate init+expect_tx\n   - TMA instruction: .tile qualifier required, no .L2::cache_hint, 32-bit smem addr, 64-bit global addr\n   - Protocol: mbar_init(count=1) -> arrive.expect_tx(bytes) -> TMA -> mbar_wait(parity=0)\n2. B128 WGMMA B descriptor confirmed incompatible with standard smem layout:\n   - B128 K-inner stride W=8 uint128_t = 8 full rows (for 128-byte row matrices)\n   - For [TKV][HD] matrix: K-inner elements u=0 and u=1 need to be 8 rows apart\n   - But k=0..7 and k=8..15 of same TKV-row are 1 uint128_t apart (adjacent cols), NOT 8 rows\n   - Empirically confirmed: all j-groups read from rows 7-8 regardless of intended TKV position\n   - Difference per j-group = 8 (= 1 uint128_t), not 512 (= j*8 rows difference)\n   - SBO=64, B128, TMA-loaded: D[j] = 32256+512j instead of 0+512j\n   - Root cause: canonical B128 MN-major requires K[TKV=j][HD=0..7] and K[TKV=j][HD=8..15] to be\n     8 full rows apart in smem, but standard row-major and TMA store them in adjacent columns\nDEAD PATHS:\n- All SBO/LBO combinations (0..256) with B128 descriptor: wrong\n- kNONE (INTERLEAVE): reads only k=0,8,16,...,56 (sparse), k-advance non-functional\n- transB=0/transB=1 manual layouts: same incompatibility\n- TMA-loaded B128 with SBO=64: same wrong pattern as manual\nCONCLUSION: WGMMA m64n64k16 BF16 for flash attention requires FA3 architecture:\n  - Producer/consumer warp specialization\n  - TMA in SPECIFIC interleaved tile configuration (not standard row-major)\n  - Warpgroup-level online softmax\n  - Cannot be implemented by simple WMMA->WGMMA replacement\nCurrent best: Round 10 WMMA 0.472ms (reverted to this)"
+    }
+  }
+]

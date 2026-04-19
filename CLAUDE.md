@@ -18,15 +18,20 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 ## 角色（各自独立 Agent，上下文不共享）
 
-三个角色均以**独立 Agent** 方式启动，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
+三个角色均以**异步子 Agent**（`Agent` tool，`run_in_background=false`）方式启动，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
 
-| 角色 | 触发方式 | 输入 | 输出 |
-|------|----------|------|------|
-| `/planner` | skill | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
-| `/generator` | skill | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
-| `/evaluator` | skill | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
+| 角色 | 触发方式 | subagent_type | 输入 | 输出 |
+|------|----------|---------------|------|------|
+| `/planner` | `Agent` tool | `general-purpose` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
+| `/generator` | `Agent` tool | `general-purpose` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
+| `/evaluator` | `Agent` tool | `general-purpose` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
 
 **顺序**：planner → generator → evaluator → planner → …（严格串行，不并行）
+
+**强制要求**：
+- 每个角色**必须**通过 `Agent` tool 以独立子 Agent 启动，禁止在主对话中直接执行角色逻辑。
+- 子 Agent prompt 必须包含：角色名、输入文件路径、输出文件路径、具体执行指令。
+- 主 Agent 只负责串行调度：等待上一个子 Agent 完成后再启动下一个。
 
 > **上下文节省关键**：每次只开一个角色 Agent，完成后关闭。下一角色读持久化文件，不看聊天记录。
 
@@ -70,3 +75,9 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ### smem 超过 48KB 默认上限
 - 静态 `__shared__` 如果超过 49152 字节（48KB），kernel launch 会报 `cudaErrorInvalidArgument`。
 - 双缓冲 K/V（Round 3-4 尝试）：Q[64][66]+K[2][64][66]+V[2][64][66]+S[64][66] = 49664B > 48KB → 必须减小或动态申请。
+
+### TMA + WGMMA B128 根本不兼容（Round 12-13 终极诊断）
+- **TMA 正确协议**（CUDA 12.6 H800）：用 `mbarrier.arrive.expect_tx`（既 arrive 又 expect TX），TMA 指令需 `.tile`，smem 32-bit，global 64-bit
+- **B128 WGMMA K-inner stride W=8 uint128_t = 8 完整行** → 对 [TKV][HD] 矩阵不兼容（同行相邻列 != 8 行间距）
+- TMA 加载后 B128 描述符仍错（实测：所有 j-group 读 rows 7-8，差值 512/j 变成 512+j*8=wrong）
+- **结论**：WGMMA flash attention 必须 FA3 完整架构（warp 专用化 + TMA interleaved tile + warpgroup softmax）

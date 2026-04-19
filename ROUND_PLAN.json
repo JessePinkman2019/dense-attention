@@ -1,21 +1,84 @@
 {
-  "round": 10,
+  "round": 13,
   "brain": "planner",
-  "timestamp": "2026-04-19T00:10:00",
-  "direction": "plateau_handling_try_different_principle",
-  "rationale": "Rounds 5-9 tile size sweep: TILE_KV=16→0.566, 32→0.491, 48→0.473(best), 64→0.574. WMMA ceiling ~0.47ms. 连续3轮改善<5%进入平台期: 按策略需换完全不同的技术原理。选项A: 接受0.473ms作为WMMA上限，记录WGMMA发现。选项B: 尝试PTX级别的mma.sync.aligned.m16n8k16 (WMMA的底层PTX替代，可能更紧凑的寄存器layout)。选项C: 尝试TILE_Q=128 (更大Q tile)配合TILE_KV=48减少barrier次数。实际上平台期处理原则建议换完全不同的方向: 本轮尝试完全不同的attention计算结构——使用2-pass approach (non-flash): (1) compute full S=QK^T/scale per Q-tile (no online softmax), (2) softmax, (3) O=P*V. 这样避开online-softmax的register压力，可以用更aggressive的WMMA/WGMMA配置。注意: 需要足够的smem存S矩阵: S[TILE_Q][TILE_KV] BF16, 对TILE_Q=64,TILE_KV=64: 64*64*2=8KB, 总smem可控。",
+  "timestamp": "2026-04-19T20:00:00",
+  "direction": "TMA+WGMMA_rs_form",
+  "rationale": "Round 12 exhaustively proved B128 without TMA is broken for K_step=16 BF16. TMA required. deep_gemm confirms TMA+B128+make_smem_desc(ptr,1,0,1024) works. Use rs-form to avoid A-descriptor complexity.",
   "implementation_spec": {
-    "kernel": "flash_attn_twopass_kernel",
-    "approach": "2-pass attention: pass1 compute S=QK^T (can use WMMA qk_acc[4] since it doesn't persist across KV iterations), pass2 apply softmax+AV simultaneously using persistent S",
-    "tile_q": 64,
-    "tile_kv": 64,
-    "block_threads": 128,
-    "smem": "Q[64][66]+K[64][66]+V[64][66]+S[64][66]=33KB (same as Round 2)",
-    "key_difference": "No online softmax running average m/l across iterations. Instead: (1) per-block: compute S=QK^T for all KV tiles accumulating max in smem, then (2) normalize and compute O=P*V in second pass. BUT this requires 2 passes over KV data = 2x bandwidth. So this is likely SLOWER not faster.",
-    "honest_assessment": "2-pass will be slower due to 2x KV memory traffic. Better alternative: try WMMA TILE_KV=48 with __launch_bounds__(128,5) to see if that pushes registers lower.",
-    "actual_plan": "Try __launch_bounds__(128,5) with TILE_KV=48 to force compiler to target 5 blocks/SM (65536/(128*5)=102 reg cap ≈ current 100). May give slight improvement through better compiler code gen.",
-    "target_milestone": "M3 if possible, else accept 0.473ms plateau",
-    "acceptance": "correctness PASS + latency < 0.45ms if possible"
+    "approach": "TMA+WGMMA rs-form flash attention on H800 SM90a",
+    "smem_layout": {
+      "Q_smem": "TQ=64 x HD=64 BF16, cp.async linear",
+      "K_smem": "TKV=64 x HD=64 BF16, TMA B128 (transB=1 for QK WGMMA)",
+      "V_smem": "TKV=64 x HD=64 BF16, TMA B128 (transB=0 for AV WGMMA)",
+      "S_smem": "TQ=64 x TKV=64 BF16, thread-written linear",
+      "mbarrier": "2x uint64_t for K and V TMA sync"
+    },
+    "tma_descriptor_creation": {
+      "function": "cuTensorMapEncodeTiled from <cuda.h>, linked with -lcuda",
+      "params": {
+        "data_type": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+        "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+        "tensor_rank": 2,
+        "global_dim": "[HD, seq_len*num_heads*batch_size] -- fast dim first",
+        "global_strides": "[HD * 2]  -- row stride in bytes",
+        "box_dim": "[HD, TKV]",
+        "element_strides": "[1, 1]"
+      },
+      "note": "Same TMA descriptor shape for K and V"
+    },
+    "tma_load_ptx": "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes",
+    "wgmma_descriptor": {
+      "macro": "make_smem_desc(ptr, layout_type=1, lbo=0, stride_byte_offset=1024)",
+      "bit_layout": "bits[63:62]=1(B128), bits[45:32]=64(SBO=1024/16), bits[13:0]=ptr>>4",
+      "k_advance": "desc.reg32_[0] += 2 per k-step (32 bytes = 1 TMA-B128 K-group width)",
+      "QK_transB": 1,
+      "AV_transB": 0
+    },
+    "rs_form_A_layout": {
+      "thread": "warp_id=t/32, lane_id=t%32",
+      "rows": "row0=warp_id*16+lane_id/4, row1=row0+8",
+      "k_col_step_kt": "(lane_id&3)*2 + kt*16",
+      "registers": [
+        "a[0]=pack(smem[row0][k], smem[row0][k+1])",
+        "a[1]=pack(smem[row0][k+8], smem[row0][k+9])",
+        "a[2]=pack(smem[row1][k], smem[row1][k+1])",
+        "a[3]=pack(smem[row1][k+8], smem[row1][k+9])"
+      ]
+    },
+    "loop_structure": [
+      "Load Q via cp.async + __syncthreads()",
+      "For each KV tile kv=0..num_kv-1:",
+      "  thread0: issue TMA load K (with mbarrier_k)",
+      "  thread0: issue TMA load V (with mbarrier_v)",
+      "  __syncthreads()",
+      "  wait mbarrier_k (K ready)",
+      "  wgmma.fence; QK rs-form x4 k-steps; wgmma.commit; wgmma.wait",
+      "  scale + mask + online softmax (same as WMMA version)",
+      "  write S_smem",
+      "  wait mbarrier_v (V ready)",
+      "  __syncthreads() -- for S_smem visibility",
+      "  wgmma.fence; AV rs-form x4 k-steps; wgmma.commit; wgmma.wait",
+      "  __syncthreads()"
+    ],
+    "mbarrier_ptx": {
+      "init": "mbarrier.init.shared::cta.b64 [addr], 1",
+      "expect_tx": "mbarrier.expect_tx.b64 [addr], bytes",
+      "arrive_tx": "set by TMA hardware automatically",
+      "wait": "loop: mbarrier.try_wait.parity.b64 P, [addr], phase; @!P bra LOOP"
+    },
+    "tile_sizes": {"TQ": 64, "TKV": 64, "HD": 64, "BLK": 128},
+    "smem_total": "4 * 64*64*2 + 16 = 32784 bytes < 48KB",
+    "setup_py_changes": {
+      "libraries": "Add 'cuda' to link with libcuda.so for cuTensorMapEncodeTiled",
+      "nvcc_flags": "Keep existing, optionally add -DCUTLASS_ARCH_MMA_SM90A_ENABLED"
+    },
+    "expected_latency": "< 0.38ms target (WGMMA 4th-gen TC ~2x WMMA throughput)",
+    "acceptance": "correctness PASS (test.py all N values) + latency < 0.38ms"
   },
-  "next_round_hint": "If all WMMA optimizations exhausted: final answer is 0.473ms (M2 achieved, M3 requires WGMMA+FA3 architecture). Document findings and conclude session."
+  "dead_paths_do_not_retry": [
+    "B128 ANY manual swizzle formula without TMA - broken for K_step=16 BF16",
+    "kNONE INTERLEAVE layout - k-advance non-functional",
+    "transB=0/1 manual smem store for WGMMA B",
+    "ss-form WGMMA with manually-written A smem"
+  ]
 }
