@@ -16,15 +16,19 @@ cat csrc/attention.cu
 cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ```
 
-## 角色
+## 角色（各自独立 Agent，上下文不共享）
 
-每个 session 只扮演一个角色，用 skill 触发：
+三个角色均以**独立 Agent** 方式启动，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
 
-- `/planner` — 读 session log → 写 ROUND_PLAN.json
-- `/generator` — 读 ROUND_PLAN.json → 实现 attention.cu → git commit
-- `/evaluator` — 编译→正确性→性能→写 session log→更新 Memory
+| 角色 | 触发方式 | 输入 | 输出 |
+|------|----------|------|------|
+| `/planner` | skill | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
+| `/generator` | skill | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
+| `/evaluator` | skill | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
 
-**顺序**：planner → generator → evaluator → planner → …
+**顺序**：planner → generator → evaluator → planner → …（严格串行，不并行）
+
+> **上下文节省关键**：每次只开一个角色 Agent，完成后关闭。下一角色读持久化文件，不看聊天记录。
 
 ---
 
