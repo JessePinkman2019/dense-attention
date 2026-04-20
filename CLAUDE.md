@@ -11,11 +11,16 @@
 ## 启动协议（每个新 session 必须先执行）
 
 ```bash
+# 1. 验证 CUDA extension 正确加载（HAS_CUDA_EXT 必须为 True）
+python -c "import sys; sys.path.insert(0,'python'); import attn_cuda; print('CUDA ext OK')"
+
+# 2. 读取历史记录
 python3 -c "import json,os; events=json.load(open('optimization_session.json')) if os.path.exists('optimization_session.json') else []; [print(json.dumps(e,indent=2,ensure_ascii=False)) for e in events[-3:]] or print('第 0 轮，尚未开始')"
 cat csrc/attention.cu
 cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ```
 
+> **若 CUDA ext 加载失败**：`setup.py` 缺少 RPATH，需检查是否有 `extra_link_args=[f"-Wl,-rpath,{torch_lib_dir}"]`，重新 `pip install -e .`。
 > **若最近3轮 correctness_pass 全为 False**：向前查找最后一个 correctness_pass=True 的轮次，
 > 用 `git log --oneline` 找到对应 commit，`git show <hash>:csrc/attention.cu` 恢复为 baseline，
 > 再运行 `python tests/test_correctness.py` 验证后再继续。
@@ -23,53 +28,42 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 ## 角色（各自独立 Agent，上下文不共享）
 
-三个角色均以**独立进程**方式启动，通过 Bash tool 调用 `ept claude`，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
+三个角色均以**异步子 Agent** 方式启动，通过 `Agent` tool（`subagent_type: general-purpose`，`model: opus`）依次调用，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
 
 | 角色 | 模型 | 输入 | 输出 |
 |------|------|------|------|
-| `/planner` | `azure-gpt-5_4` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
-| `/generator` | `minimax-m2.5` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
-| `/evaluator` | `minimax-m2.5` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
+| `/planner` | `opus 4.7` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
+| `/generator` | `opus 4.7` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
+| `/evaluator` | `opus 4.7` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
 
 **顺序**：planner → generator → evaluator → planner → …（严格串行，不并行）
 
-**执行方式**：主 Agent 通过 Bash tool 依次调用，等待每个进程完成后再启动下一个：
+**执行方式**：主 Agent 通过 `Agent` tool 依次启动，等待每个子 Agent 完成后再启动下一个：
 
-```bash
-# Planner
-ept claude --model gpt-5_4 --permission-mode auto \
-  -p "$(cat <<'PROMPT'
-你是 /planner。工作目录：/chj/home/wanglang3/code/dense-attention
+```
+# Planner（Agent tool，model: opus）
+prompt: "你是 /planner。工作目录：/chj/home/wanglang3/code/dense-attention
 读取 optimization_session.json 最近3轮，结合 csrc/attention.cu 现状，
 输出下一轮优化方向到 ROUND_PLAN.json。
-格式：{"round": N, "brain": "planner", "direction": "...", "implementation_spec": {...}, ...}
-PROMPT
-)"
+格式：{\"round\": N, \"brain\": \"planner\", \"direction\": \"...\", \"implementation_spec\": {...}, ...}"
 
-# Generator
-ept claude --model minimax-m2.5 --permission-mode auto \
-  -p "$(cat <<'PROMPT'
-你是 /generator。工作目录：/chj/home/wanglang3/code/dense-attention
+# Generator（Agent tool，model: opus）
+prompt: "你是 /generator。工作目录：/chj/home/wanglang3/code/dense-attention
 读取 ROUND_PLAN.json，按 implementation_spec 修改 csrc/attention.cu，
-然后执行：git add csrc/attention.cu && git commit -m "round_N: <描述>"
-PROMPT
-)"
+然后执行：git add csrc/attention.cu && git commit -m \"round_N: <描述>\""
 
-# Evaluator
-ept claude --model minimax-m2.5 --permission-mode auto \
-  -p "$(cat <<'PROMPT'
-你是 /evaluator。工作目录：/chj/home/wanglang3/code/dense-attention
+# Evaluator（Agent tool，model: opus）
+prompt: "你是 /evaluator。工作目录：/chj/home/wanglang3/code/dense-attention
 对最新 git commit 执行强制 Checklist（Step 1-7，见下方），
-结果追加到 optimization_session.json。
-PROMPT
-)"
+结果追加到 optimization_session.json。"
 ```
 
 **强制要求**：
-- 每个角色**必须**通过独立 `ept claude` 进程执行，禁止在主对话中直接执行角色逻辑。
-- 主 Agent 只负责串行调度：Bash tool 顺序执行，等待每个命令返回后再运行下一个。
+- 每个角色**必须**通过独立 `Agent` tool 调用执行（`subagent_type: general-purpose`，`model: opus`），禁止在主对话中直接执行角色逻辑。
+- 主 Agent 只负责串行调度：顺序调用 Agent tool，等待每个子 Agent 返回后再启动下一个。
+- 每个子 Agent prompt 必须完整自包含（包含工作目录、角色、任务说明），不依赖主对话上下文。
 
-> **上下文节省关键**：每次只启动一个角色进程，完成后退出。下一角色读持久化文件，不看聊天记录。
+> **上下文节省关键**：每次只启动一个子 Agent，完成后退出。下一个子 Agent 读持久化文件，不看聊天记录。
 
 ### ⚠️ 角色分离失效的教训（Round 12-13 反面案例）
 

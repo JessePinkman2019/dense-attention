@@ -1,84 +1,99 @@
 {
-  "round": 13,
+  "round": 17,
   "brain": "planner",
-  "timestamp": "2026-04-19T20:00:00",
-  "direction": "TMA+WGMMA_rs_form",
-  "rationale": "Round 12 exhaustively proved B128 without TMA is broken for K_step=16 BF16. TMA required. deep_gemm confirms TMA+B128+make_smem_desc(ptr,1,0,1024) works. Use rs-form to avoid A-descriptor complexity.",
+  "timestamp": "2026-04-20T17:00:00+08:00",
+  "direction": "正确 WGMMA m64n64k16 kernel：修复 accumulator 布局 + AV reset bug + 跨 warp softmax 规约",
+  "rationale": "Round 16 已完全分析出所有 WGMMA bug 的根因，Round 17 只需按已知修复方案实现。核心发现：accumulator layout 中 j/r/c 含义与代码假设完全相反；AV WGMMA 不能 reset；同行数据跨 4 个 warp 分布，需 smem 规约。",
+  "precondition": "当前 attention.cu = Round 10 WMMA baseline (git 5a16b93)。Generator 必须从零重写 WGMMA kernel，不要 restore Round 11-16 的任何代码。",
   "implementation_spec": {
-    "approach": "TMA+WGMMA rs-form flash attention on H800 SM90a",
+    "approach": "重写 flash_attn_wgmma_kernel，基于正确的 WGMMA m64n64k16 accumulator layout",
+
+    "critical_layout_knowledge": {
+      "source": "CUTLASS CLayout_64x64 = Layout<Shape<(4,8,4),(2,2,8)>, Stride<(128,1,16),(64,8,512)>>",
+      "formula": "对 thread t（l=t%32，w=t/32），寄存器 acc[j][r][c]（v=j*4+r*2+c）：\n  actual_row = (l&3)*2 + c + j*8   [0..63]\n  actual_col = (l>>2) + r*8 + w*16 [0..63]",
+      "key_insight": "j 控制行（每 8 行一组），r 控制列（0 或 +8），c 控制行内偏移（0 或 +1）。与 Round 11-16 的假设完全相反。",
+      "inter_warp_constraint": "同一 actual_row 的值分布在全部 4 个 warp（via 不同 w）→ intra-warp shuffle 不足，必须 smem 跨 warp 规约。"
+    },
+
     "smem_layout": {
-      "Q_smem": "TQ=64 x HD=64 BF16, cp.async linear",
-      "K_smem": "TKV=64 x HD=64 BF16, TMA B128 (transB=1 for QK WGMMA)",
-      "V_smem": "TKV=64 x HD=64 BF16, TMA B128 (transB=0 for AV WGMMA)",
-      "S_smem": "TQ=64 x TKV=64 BF16, thread-written linear",
-      "mbarrier": "2x uint64_t for K and V TMA sync"
+      "Q_smem": "__shared__ __align__(1024) __nv_bfloat16 Q_smem[64][64]  // 8KB",
+      "K_smem": "__shared__ __nv_bfloat16 K_smem[64][64]  // 8KB",
+      "V_smem": "__shared__ __nv_bfloat16 V_smem[64][64]  // 8KB",
+      "S_smem": "__shared__ __nv_bfloat16 S_smem[64][64]  // 8KB",
+      "rsmem":  "__shared__ float rsmem[4][4][8][2]       // 1KB，inter-warp max/sum 规约",
+      "total":  "33KB < 48KB 静态 smem 上限",
+      "swizzle": "128B swizzle：swiz(row,col) = ((col>>3)^(row&7))<<3|(col&7)"
     },
-    "tma_descriptor_creation": {
-      "function": "cuTensorMapEncodeTiled from <cuda.h>, linked with -lcuda",
-      "params": {
-        "data_type": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
-        "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
-        "tensor_rank": 2,
-        "global_dim": "[HD, seq_len*num_heads*batch_size] -- fast dim first",
-        "global_strides": "[HD * 2]  -- row stride in bytes",
-        "box_dim": "[HD, TKV]",
-        "element_strides": "[1, 1]"
-      },
-      "note": "Same TMA descriptor shape for K and V"
+
+    "wgmma_descriptors": {
+      "function": "__device__ __forceinline__ uint64_t make_smem_desc_128b(uint64_t leading, uint64_t stride, const void* ptr)",
+      "QK_A": "make_smem_desc_128b(16, 1024, &Q_smem[0][kt*16])",
+      "QK_B": "make_smem_desc_128b(16, 1024, &K_smem[0][kt*16])",
+      "AV_A": "make_smem_desc_128b(16, 1024, &S_smem[0][kt*16])",
+      "AV_B": "make_smem_desc_128b(1024, 1024, &V_smem[kt*16][0])",
+      "note": "每个 k-step 重新创建 descriptor（不用 set_addr）"
     },
-    "tma_load_ptx": "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes",
-    "wgmma_descriptor": {
-      "macro": "make_smem_desc(ptr, layout_type=1, lbo=0, stride_byte_offset=1024)",
-      "bit_layout": "bits[63:62]=1(B128), bits[45:32]=64(SBO=1024/16), bits[13:0]=ptr>>4",
-      "k_advance": "desc.reg32_[0] += 2 per k-step (32 bytes = 1 TMA-B128 K-group width)",
-      "QK_transB": 1,
-      "AV_transB": 0
+
+    "wgmma_instructions": {
+      "QK": "wgmma.mma_async...m64n64k16.f32.bf16.bf16 ..., desc_a, desc_b, scale_d, 1, 1, 0, 1  (transA=0, transB=1)",
+      "AV": "wgmma.mma_async...m64n64k16.f32.bf16.bf16 ..., desc_a, desc_b, 1,       1, 1, 0, 0  (transA=0, transB=0, 永远 scale_d=1)",
+      "QK_init": "kt=0 时 scale_d=0（reset qk_acc），kt>0 时 scale_d=1",
+      "AV_init": "始终 scale_d=1（o_acc 在 kernel 开始时初始化为 0，之后永远累积）"
     },
-    "rs_form_A_layout": {
-      "thread": "warp_id=t/32, lane_id=t%32",
-      "rows": "row0=warp_id*16+lane_id/4, row1=row0+8",
-      "k_col_step_kt": "(lane_id&3)*2 + kt*16",
-      "registers": [
-        "a[0]=pack(smem[row0][k], smem[row0][k+1])",
-        "a[1]=pack(smem[row0][k+8], smem[row0][k+9])",
-        "a[2]=pack(smem[row1][k], smem[row1][k+1])",
-        "a[3]=pack(smem[row1][k+8], smem[row1][k+9])"
-      ]
+
+    "online_softmax_design": {
+      "tracking": "float m_run[8][2], l_run[8][2]  // 每个 (j,c) 对应一个 actual_row 组",
+      "row_formula": "actual_row for acc[j][r][c] = (l&3)*2 + c + j*8",
+      "col_formula": "actual_col for acc[j][r][c] = (l>>2) + r*8 + warp_id*16",
+
+      "per_kv_tile_steps": [
+        "1. QK WGMMA（4 kt-steps，qk_acc 局部变量）",
+        "2. Scale + 末尾 mask（用 actual_col 公式）",
+        "3. 线程内 max：pm[j][c] = max(qk_acc[j][0][c], qk_acc[j][1][c])",
+        "4. Warp 内规约（xor 4,8,16）：同 l%4 的线程归约",
+        "5. 跨 warp smem max：q_col==0 的线程写 rsmem[warp][q_grp][j][c]，__syncthreads",
+        "6. 读回 rsmem 得全局 pm[j][c]，更新 m_run[j][c]，rescale o_acc 和 l_run",
+        "7. 计算 exp、写 S_smem[actual_row][swiz(actual_row,actual_col)]、累加 ps[j][c]",
+        "8. Warp 内 sum 规约（xor 4,8,16）",
+        "9. 跨 warp smem sum：写 rsmem，__syncthreads，读回，更新 l_run[j][c]",
+        "10. AV WGMMA（4 kt-steps，o_acc 永久累积）",
+        "11. __syncthreads（允许 K/V smem 复用）"
+      ],
+
+      "smem_reduction_detail": {
+        "who_writes": "只有 q_col==0（即 lane>>2 == 0，lane ∈ {0,1,2,3}）的线程写",
+        "index": "rsmem[warp_id][q_grp][j][c]，q_grp = lane&3",
+        "who_reads": "所有线程读本组 4 个 warp 的值取 max/sum",
+        "syncthreads_count": "2 次 per KV tile（max 后 + sum 后），外加原有 2 次（加载 KV + AV 结束）= 4 次"
+      }
     },
-    "loop_structure": [
-      "Load Q via cp.async + __syncthreads()",
-      "For each KV tile kv=0..num_kv-1:",
-      "  thread0: issue TMA load K (with mbarrier_k)",
-      "  thread0: issue TMA load V (with mbarrier_v)",
-      "  __syncthreads()",
-      "  wait mbarrier_k (K ready)",
-      "  wgmma.fence; QK rs-form x4 k-steps; wgmma.commit; wgmma.wait",
-      "  scale + mask + online softmax (same as WMMA version)",
-      "  write S_smem",
-      "  wait mbarrier_v (V ready)",
-      "  __syncthreads() -- for S_smem visibility",
-      "  wgmma.fence; AV rs-form x4 k-steps; wgmma.commit; wgmma.wait",
-      "  __syncthreads()"
-    ],
-    "mbarrier_ptx": {
-      "init": "mbarrier.init.shared::cta.b64 [addr], 1",
-      "expect_tx": "mbarrier.expect_tx.b64 [addr], bytes",
-      "arrive_tx": "set by TMA hardware automatically",
-      "wait": "loop: mbarrier.try_wait.parity.b64 P, [addr], phase; @!P bra LOOP"
+
+    "output_write": {
+      "row": "q_start + (lane&3)*2 + c + j*8",
+      "col": "(lane>>2) + r*8 + warp_id*16",
+      "normalize": "o_acc[j][r][c] / l_run[j][c]"
     },
-    "tile_sizes": {"TQ": 64, "TKV": 64, "HD": 64, "BLK": 128},
-    "smem_total": "4 * 64*64*2 + 16 = 32784 bytes < 48KB",
-    "setup_py_changes": {
-      "libraries": "Add 'cuda' to link with libcuda.so for cuTensorMapEncodeTiled",
-      "nvcc_flags": "Keep existing, optionally add -DCUTLASS_ARCH_MMA_SM90A_ENABLED"
+
+    "pybind11_binding": {
+      "note": "必须在文件末尾加 attn_forward 包装函数 + PYBIND11_MODULE",
+      "example": "见 git show 5a16b93:csrc/attention.cu 末尾 attn_forward + PYBIND11_MODULE"
     },
-    "expected_latency": "< 0.38ms target (WGMMA 4th-gen TC ~2x WMMA throughput)",
-    "acceptance": "correctness PASS (test.py all N values) + latency < 0.38ms"
+
+    "setup_py_rpath": {
+      "status": "已修复：extra_link_args=[f'-Wl,-rpath,{torch_lib_dir}']",
+      "verify": "python -c \"import sys; sys.path.insert(0,'python'); import attn_cuda; print('ok')\""
+    },
+
+    "expected_latency_ms": "TBD（首先验证正确性）",
+    "acceptance_criteria": "python tests/test_correctness.py 全部 PASS，max_diff < 0.01"
   },
+
   "dead_paths_do_not_retry": [
-    "B128 ANY manual swizzle formula without TMA - broken for K_step=16 BF16",
-    "kNONE INTERLEAVE layout - k-advance non-functional",
-    "transB=0/1 manual smem store for WGMMA B",
-    "ss-form WGMMA with manually-written A smem"
+    "make_desc_base + set_addr（leading=0）— Round 11-15 反复失败",
+    "WGMMA accumulator 按 row0=warp*16+lane/4 解读 — 布局完全错误",
+    "intra-warp shuffle（xor 1,2）用于 per-row 规约 — 无法覆盖跨 warp 数据",
+    "AV WGMMA 对 kt=0 使用 scale_d=0 — 破坏 o_acc 跨 KV tile 累积",
+    "cp.async double-buffer + WGMMA（未修正布局）— Round 14 失败",
+    "WGMMA rs-form — 9行 acc 布局与 online softmax 不兼容"
   ]
 }

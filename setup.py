@@ -1,8 +1,11 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import torch
+import os
 
 assert torch.cuda.is_available(), "需要 CUDA 环境来编译"
+
+torch_lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
 
 nvcc_flags = [
     "-O3",
@@ -31,6 +34,7 @@ setup(
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
             },
+            extra_link_args=[f"-Wl,-rpath,{torch_lib_dir}"],
         )
     ],
     cmdclass={"build_ext": BuildExtension},

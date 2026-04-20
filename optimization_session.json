@@ -342,5 +342,74 @@
       "primary_bottleneck": "wmma_ceiling_0.472ms",
       "notes": "已恢复 Round 10 WMMA baseline (git: 5a16b93)。\n正确性验证通过 (N=64/128/256/512 全部 PASS)。\n\n== 完整历史修正 ==\nRound 11 (01eb002): correctness_pass 原记录为 True，实为 False (max_diff=0.914)。\nRound 12-14: WGMMA ss-form，全部 correctness_pass=False。\n唯一可用 WGMMA baseline 不存在，必须从 Round 10 WMMA 重新出发。\n\n== WGMMA ss-form 根本结论 ==\n诊断（本 session）：scalar 全通过，两个 WGMMA 阶段（QK transB=1, AV transB=0）均独立出错。\n错误稳定在 max_diff=1.219，跨 swizzle/descriptor/fence/clobber 所有修改不变。\n已排除：swizzle 函数、smem 对齐、软件算法、descriptor 构造（与 deep_gemm 一致）、fence memory clobber、warpgroup_fence_operand。\n未解决：为什么 WGMMA 产生确定性错误结果。\n\n== 下一轮方向建议 ==\nOption A（保守，推荐）：在 Round 10 WMMA 上做 L2 reuse / CTA swizzle / grid config 优化，目标 0.40ms。\nOption B（激进）：直接复制 flashinfer/data/include/flashinfer/attention/hopper.cuh 的\n  make_smem_desc<SwizzleMode::k128B> 和 get_swizzle_offset，完全替换我们的 swiz/make_desc_base/set_addr，\n  从第一性原理验证 WGMMA 是否能通过正确性测试。"
     }
+  },
+  {
+    "round": 15,
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T15:00:00",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": null,
+        "sm_active_cycles_pct": null,
+        "occupancy_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": null,
+        "l1tex_throughput_pct": null,
+        "l2_throughput_pct": null
+      },
+      "primary_bottleneck": "wgmma_accumulator_layout_completely_wrong",
+      "notes": "Round 15: CORRECTNESS FAIL (max_diff=1.219, same as all prior WGMMA rounds)\n\n== HYPOTHESIS DISPROVEN ==\nRound 15 changed leading_byte_offset from 0 to 16 (matching FlashInfer hopper.cuh).\nResult: still max_diff=1.219. The descriptor parameters were NOT the root cause.\n\n== ROOT CAUSE IDENTIFIED (confirmed via CUTLASS CLayout_64x64 analysis) ==\nThe WGMMA m64n64k16 accumulator layout is:\n  CLayout_64x64 = Layout<Shape<(4,8,4),(2,2,8)>, Stride<(128,1,16),(64,8,512)>>\n\nFor thread t (l=t%32, w=t/32) and register index v (a=v%2, b=(v/2)%2, c=v/4):\n  position = (l%4)*128 + (l/4)*1 + w*16 + a*64 + b*8 + c*512\n  actual_row = position / 64 = (l%4)*2 + a + c*8\n  actual_col = position % 64 = l/4 + b*8 + w*16\n\nIn acc[j][r][c] indexing (register v = j*4 + r*2 + c):\n  a = c (acc c-index)\n  b = r (acc r-index)\n  c_val = j (acc j-index)\n\nTherefore:\n  actual_row = (l%4)*2 + acc_c + acc_j*8   (NOT w*16 + l/4 + acc_r*8 as code assumes)\n  actual_col = l/4 + acc_r*8 + w*16        (NOT acc_j*8 + (l%4)*2 + acc_c as code assumes)\n\nCONCRETE PROOF (thread 0, v=1):\n  Code assumes: acc[0][0][1] at (row=0, col=1)\n  Actual:       acc[0][0][1] at (row=1, col=0)\nThe r and c dimensions are completely swapped in their row/col effects.\nThe j dimension selects 8-ROW groups (not 8-col groups as code assumes).\n\n== IMPLICATIONS ==\n1. Softmax row tracking uses wrong rows -> wrong max/sum -> wrong exp scaling\n2. S_smem written to wrong row/col positions\n3. Output written to wrong row/col positions\n4. The r and c swap means online softmax tracks two different ROW VALUES (a=0,1) as if they were same-row different-cols\n\n== KEY CONSTRAINT IDENTIFIED ==\nSame actual output row is spread across ALL 4 WARPS (via different l/4 and w values).\nIntra-warp shuffles CANNOT reduce a full row. Requires either:\n  (a) Smem-based inter-warp reduction (2 syncthreads per KV tile)\n  (b) Different tile structure where one warp owns full rows\n\n== REQUIRED FIX FOR ROUND 16 ==\nComplete rewrite of:\n1. Row/col formula: actual_row = (l%4)*2 + acc_c + acc_j*8\n2. Per-row max tracking: m[j][c] instead of m[2]\n3. Intra-warp reduction: xor masks 4,8,16 (NOT 1,2 as current code uses)\n4. Inter-warp reduction: smem intermediates + __syncthreads\n5. S_smem writing: use actual_row/actual_col\n6. Output writing: use actual_row/actual_col\n\nNCU metrics skipped (correctness failed at B=2,N=64)."
+    }
+  },
+  {
+    "round": 15,
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T15:00:00",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": null,
+        "sm_active_cycles_pct": null,
+        "occupancy_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": null,
+        "l1tex_throughput_pct": null,
+        "l2_throughput_pct": null
+      },
+      "primary_bottleneck": "wgmma_accumulator_layout_completely_wrong",
+      "notes": "Round 15 失败（max_diff=1.219）。\n假设「leading_byte_offset=0 是 bug」被证伪：改为16后 max_diff 仍然相同。\n\n== 发现的真正根本原因 ==\nWGMMA m64n64k16 accumulator 布局（来自 CUTLASS CLayout_64x64 分析）：\n\nCLayout_64x64 = Layout<Shape<(4,8,4),(2,2,8)>, Stride<(128,1,16),(64,8,512)>>\n\n对 thread t（l=t%32，w=t/32），寄存器 acc[j][r][c]（v=j*4+r*2+c，a=c，b=r，c_val=j）：\n  actual_row = (l&3)*2 + c + j*8   [范围 0..63]\n  actual_col = (l>>2) + r*8 + w*16 [范围 0..63]\n\n代码假设（全部错误）：\n  row = warp_id*16 + lane/4 + r*8  ← 错\n  col = j*8 + (lane%4)*2 + c       ← 错\n\nc 和 r 的行列效果完全对调；j 控制行（不是列）。\n\n== 关键约束 ==\n同一 actual_row 的值分布在全部 4 个 warp（不同 w）→\nintra-warp shuffle 不够，必须 smem 跨 warp 规约。\n\n== 验证 ==\nPython 计算验证（对所有 128 线程 × 32 寄存器）：公式正确覆盖全部 4096 输出位置。"
+    }
+  },
+  {
+    "round": 16,
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T16:30:00",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": null,
+        "sm_active_cycles_pct": null,
+        "occupancy_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": null,
+        "l1tex_throughput_pct": null,
+        "l2_throughput_pct": null
+      },
+      "primary_bottleneck": "av_wgmma_resets_o_acc_per_kv_tile_plus_missing_pybind11",
+      "notes": "Round 16 编写了正确 accumulator 布局的 WGMMA kernel，但发现两个 bug：\n\nBug 1（已发现）：AV WGMMA 对每个 KV tile 的 kt=0 使用 scale_d=0（reset），\n  导致 o_acc 在每个 KV tile 开始时被清零，破坏跨 tile 累积。\n  修复：AV WGMMA 始终使用 scale_d=1（永远累积），因为 o_acc 初始化为 0 已足够。\n\nBug 2（已发现）：attention.cu 缺少 PYBIND11_MODULE binding（attn_forward + m.def）。\n  修复：在文件末尾添加 attn_forward 包装函数和 PYBIND11_MODULE。\n\n额外发现：setup.py 缺少正确 RPATH，导致历史所有 session 的 HAS_CUDA_EXT=False。\n  修复：setup.py 加 extra_link_args=[f-Wl,-rpath,{torch_lib_dir}]。\n\n== 历史影响评估 ==\nRound 10 WMMA（5a16b93）：真实通过。该 commit 有 PYBIND11 binding，RPATH 固定后\n  HAS_CUDA_EXT=True，correctness PASS，latency=0.472ms（已于本 session 验证）。\n\nRound 11-15 WGMMA：全部真实失败（correctness_pass=False），与记录一致。\n\nRound 16 本 session 的「假通过」：extension 未加载时两边都跑 PyTorch 参考实现，\n  max_diff 仅反映 BF16 vs FP32 精度差（约 0.003），不是 kernel 正确性。\n\n== Round 17 任务 ==\n从 Round 10 WMMA baseline 出发，实现正确 WGMMA kernel：\n  1. accumulator 布局：actual_row=(l&3)*2+c+j*8，actual_col=(l>>2)+r*8+w*16\n  2. AV WGMMA 始终 scale_d=1\n  3. 跨 warp 的 per-row 规约：smem float[4][4][8][2]（1KB），2次 __syncthreads per KV tile\n  4. 添加 PYBIND11 binding\n  5. setup.py 加 RPATH（已做）"
+    }
   }
 ]
