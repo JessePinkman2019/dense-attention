@@ -35,6 +35,21 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 > **上下文节省关键**：每次只开一个角色 Agent，完成后关闭。下一角色读持久化文件，不看聊天记录。
 
+### ⚠️ 角色分离失效的教训（Round 12-13 反面案例）
+
+**问题**：Round 12-13 中主 Agent 在同一对话里同时扮演三个角色，没有通过 `Agent` tool 启动独立子 Agent。导致：
+
+1. **evaluator 没有独立视角**：自己评估自己的 kernel，缺乏外部约束，导致在 WGMMA 错误路径上调试 10+ 小时而没有及早止损。
+2. **NCU 分析缺失**：正确的 evaluator 应在第一轮就运行 NCU，发现 B128 WGMMA 内存访问模式异常，而不是靠大量试错。
+3. **上下文膨胀**：单一 Agent 积累了大量中间调试状态，判断力下降，无法从全局视角识别"这条路根本走不通"。
+4. **"自己评估自己"偏差**：generator 实现的方案，由同一个 Agent 来评估，天然倾向于"再试一次"而非"放弃这条路"。
+
+**正确做法（未来必须执行）**：
+- evaluator 子 Agent 的 prompt 必须包含：**运行 NCU profile** 并分析关键指标（compute throughput、memory access pattern、register count）
+- evaluator 必须给出明确的 **Go/No-Go 判断**：如果连续2轮改善 < 5% 或出现根本性障碍（如内存布局不兼容），应直接在 ROUND_PLAN.json 中写"放弃此方向"
+- evaluator 检查清单必须包含**正确性验证**（不只是 V=1 这种退化情况，要用真实随机 Q/K/V 测试）
+- generator 产出 kernel 后，evaluator 应作为**独立 Agent** 拿到 git commit hash，从零开始评估，不依赖 generator 的解释
+
 ---
 
 ## 经验教训（反复踩坑记录）
