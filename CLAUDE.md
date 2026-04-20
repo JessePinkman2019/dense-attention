@@ -44,11 +44,79 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 3. **上下文膨胀**：单一 Agent 积累了大量中间调试状态，判断力下降，无法从全局视角识别"这条路根本走不通"。
 4. **"自己评估自己"偏差**：generator 实现的方案，由同一个 Agent 来评估，天然倾向于"再试一次"而非"放弃这条路"。
 
-**正确做法（未来必须执行）**：
-- evaluator 子 Agent 的 prompt 必须包含：**运行 NCU profile** 并分析关键指标（compute throughput、memory access pattern、register count）
-- evaluator 必须给出明确的 **Go/No-Go 判断**：如果连续2轮改善 < 5% 或出现根本性障碍（如内存布局不兼容），应直接在 ROUND_PLAN.json 中写"放弃此方向"
-- evaluator 检查清单必须包含**正确性验证**（不只是 V=1 这种退化情况，要用真实随机 Q/K/V 测试）
-- generator 产出 kernel 后，evaluator 应作为**独立 Agent** 拿到 git commit hash，从零开始评估，不依赖 generator 的解释
+**Evaluator 强制 Checklist（每轮必须全部完成，不得跳过任何步骤）**：
+
+**Step 1 — 编译**
+```bash
+CUDA_VISIBLE_DEVICES=1 pip install -e . -q 2>&1 | tail -3
+```
+- 编译失败 → 立即停止，在 session log 中记录 `compile_success: false`，通知 planner 修复。
+
+**Step 2 — 正确性（必须用真实随机 Q/K/V，不得用 V=1 等退化情况）**
+```bash
+CUDA_VISIBLE_DEVICES=1 python tests/test_correctness.py
+```
+- 任何 FAIL → 立即停止，记录 `correctness_pass: false`，禁止进行性能测试。
+- `vs_flashinfer_ratio > 1`（声称超过 FlashInfer）→ 必须标记为"待验证异常"，单独确认。
+
+**Step 3 — 延迟（B=8 config 对标基线）**
+```bash
+CUDA_VISIBLE_DEVICES=1 python -c "
+import torch, sys
+sys.path.insert(0, 'python')
+from attention import attention
+from benchmark import measure_mfu
+B, H, N, D = 8, 12, 1024, 64
+q = torch.randn(B,H,N,D, device='cuda', dtype=torch.bfloat16)
+k = torch.randn(B,H,N,D, device='cuda', dtype=torch.bfloat16)
+v = torch.randn(B,H,N,D, device='cuda', dtype=torch.bfloat16)
+m = measure_mfu(lambda: attention(q,k,v), B,H,N,D)
+print(f'latency={m[\"latency_ms\"]:.3f}ms  MFU={m[\"mfu_percent\"]:.1f}%')
+print(f'vs FlashInfer(0.311ms): {0.311/m[\"latency_ms\"]:.3f}x')
+"
+```
+
+**Step 4 — NCU Profile（每轮必跑，无例外）**
+```bash
+CUDA_VISIBLE_DEVICES=1 ncu \
+  --set full --target-processes all \
+  -o ncu_reports/our_kernel_n1024.ncu-rep \
+  python ncu_reports/profile_our_kernel_ncu.py
+```
+
+**Step 5 — NCU 指标解析（以下 7 项必须全部填入 session log，null 不可接受）**
+```bash
+CUDA_VISIBLE_DEVICES=1 ncu \
+  --import ncu_reports/our_kernel_n1024.ncu-rep \
+  --metrics \
+    sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+    sm__cycles_active.avg.pct_of_peak_sustained_elapsed,\
+    sm__warps_active.avg.pct_of_peak_sustained_active,\
+    launch__registers_per_thread,\
+    launch__shared_mem_per_block_static,\
+    l1tex__throughput.avg.pct_of_peak_sustained_elapsed,\
+    lts__throughput.avg.pct_of_peak_sustained_elapsed \
+  --print-summary per-kernel 2>&1 | head -60
+```
+必须记录的 7 项（**全部为 null 视为 evaluator 未完成工作**）：
+| 字段 | NCU 指标 | 说明 |
+|------|----------|------|
+| `compute_throughput_pct` | `sm__throughput` | 核心：< 40% 说明不在 compute bound |
+| `sm_active_cycles_pct` | `sm__cycles_active` | SM 活跃率 |
+| `occupancy_pct` | `sm__warps_active` | 实际 occupancy |
+| `registers_per_thread` | `launch__registers_per_thread` | 寄存器压力 |
+| `smem_kb` | `launch__shared_mem_per_block_static` | smem 使用 |
+| `l1tex_throughput_pct` | `l1tex__throughput` | L1/纹理缓存带宽占用 |
+| `l2_throughput_pct` | `lts__throughput` | L2 带宽占用 |
+
+**Step 6 — Go/No-Go 判断（必须明确写入 notes）**
+- **退化（latency 变差）**：必须写明具体原因，不能只写"regression"。
+- **平台期（连续2轮改善 < 5%）**：必须在 ROUND_PLAN.json 中标记"换方向"。
+- **根本性障碍**（如内存布局不兼容）：必须写"放弃此方向 + 原因"，不能继续 debug 同一条路。
+- **compute_throughput < 40% 且 occupancy < 25%**：说明 WMMA 已到天花板，planner 必须切换 WGMMA。
+
+**Step 7 — 写入 session log**
+`ncu_metrics` 中 7 项均不得为 null，否则视为 evaluator 工作不完整，本轮结果无效。
 
 ---
 
