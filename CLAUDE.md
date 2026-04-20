@@ -3,6 +3,11 @@
 > **目标**：H800 BF16 dense attention latency < 0.311ms @ B=8,N=1024（超过 FlashInfer 0.6.8）
 > **完整准则**：严格按照 `/root/.claude/plans/attention-cuda-flashinfer-plan-chj-home-compiled-bachman.md` 执行
 
+## 安全约束
+
+- **文件修改范围**：只允许修改 `/chj/home/wanglang3/code/dense-attention` 目录下的文件，禁止修改该目录之外的任何文件。当前运行在 bypass permissions on 模式下，此规则作为硬性约束必须遵守。
+- **命令执行方式**：所有 shell 命令必须通过 `docker exec wanglang3_claude bash -c "<command>"` 来执行，确保命令运行在隔离的容器环境中。
+
 ## 环境
 
 - GPU: H800，CUDA 12.6，固定用 `CUDA_VISIBLE_DEVICES=1`
@@ -15,7 +20,7 @@
 python -c "import sys; sys.path.insert(0,'python'); import attn_cuda; print('CUDA ext OK')"
 
 # 2. 读取历史记录
-python3 -c "import json,os; events=json.load(open('optimization_session.json')) if os.path.exists('optimization_session.json') else []; [print(json.dumps(e,indent=2,ensure_ascii=False)) for e in events[-3:]] or print('第 0 轮，尚未开始')"
+python3 -c "import json,os; events=json.load(open('optimization_session.json')) if os.path.exists('optimization_session.json') else []; passed=[e for e in events if e.get('correctness_pass')]; [print(json.dumps(e,indent=2,ensure_ascii=False)) for e in passed[-3:]] or print('第 0 轮，尚未开始')"
 cat csrc/attention.cu
 cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ```
@@ -32,9 +37,9 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 | 角色 | 模型 | 输入 | 输出 |
 |------|------|------|------|
-| `/planner` | `opus 4.7` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
-| `/generator` | `opus 4.7` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
-| `/evaluator` | `opus 4.7` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
+| `/planner` | `opus 4` | `optimization_session.json`（最近3轮 `correctness_pass=true`） | `ROUND_PLAN.json` |
+| `/generator` | `opus 4` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
+| `/evaluator` | `opus 4` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
 
 **顺序**：planner → generator → evaluator → planner → …（严格串行，不并行）
 
@@ -43,7 +48,7 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ```
 # Planner（Agent tool，model: opus）
 prompt: "你是 /planner。工作目录：/chj/home/wanglang3/code/dense-attention
-读取 optimization_session.json 最近3轮，结合 csrc/attention.cu 现状，
+读取 optimization_session.json 中最近3轮 correctness_pass=true 的记录，结合 csrc/attention.cu 现状，
 输出下一轮优化方向到 ROUND_PLAN.json。
 格式：{\"round\": N, \"brain\": \"planner\", \"direction\": \"...\", \"implementation_spec\": {...}, ...}"
 

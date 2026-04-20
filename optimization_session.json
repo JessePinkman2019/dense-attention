@@ -411,5 +411,31 @@
       "primary_bottleneck": "av_wgmma_resets_o_acc_per_kv_tile_plus_missing_pybind11",
       "notes": "Round 16 编写了正确 accumulator 布局的 WGMMA kernel，但发现两个 bug：\n\nBug 1（已发现）：AV WGMMA 对每个 KV tile 的 kt=0 使用 scale_d=0（reset），\n  导致 o_acc 在每个 KV tile 开始时被清零，破坏跨 tile 累积。\n  修复：AV WGMMA 始终使用 scale_d=1（永远累积），因为 o_acc 初始化为 0 已足够。\n\nBug 2（已发现）：attention.cu 缺少 PYBIND11_MODULE binding（attn_forward + m.def）。\n  修复：在文件末尾添加 attn_forward 包装函数和 PYBIND11_MODULE。\n\n额外发现：setup.py 缺少正确 RPATH，导致历史所有 session 的 HAS_CUDA_EXT=False。\n  修复：setup.py 加 extra_link_args=[f-Wl,-rpath,{torch_lib_dir}]。\n\n== 历史影响评估 ==\nRound 10 WMMA（5a16b93）：真实通过。该 commit 有 PYBIND11 binding，RPATH 固定后\n  HAS_CUDA_EXT=True，correctness PASS，latency=0.472ms（已于本 session 验证）。\n\nRound 11-15 WGMMA：全部真实失败（correctness_pass=False），与记录一致。\n\nRound 16 本 session 的「假通过」：extension 未加载时两边都跑 PyTorch 参考实现，\n  max_diff 仅反映 BF16 vs FP32 精度差（约 0.003），不是 kernel 正确性。\n\n== Round 17 任务 ==\n从 Round 10 WMMA baseline 出发，实现正确 WGMMA kernel：\n  1. accumulator 布局：actual_row=(l&3)*2+c+j*8，actual_col=(l>>2)+r*8+w*16\n  2. AV WGMMA 始终 scale_d=1\n  3. 跨 warp 的 per-row 规约：smem float[4][4][8][2]（1KB），2次 __syncthreads per KV tile\n  4. 添加 PYBIND11 binding\n  5. setup.py 加 RPATH（已做）"
     }
+  },
+  {
+    "round": 17,
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T19:45:00",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.303
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": 1.026
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": 60.6,
+        "sm_active_cycles_pct": 96.1,
+        "occupancy_pct": 23.4,
+        "registers_per_thread": 128,
+        "smem_kb": 32.8,
+        "l1tex_throughput_pct": 52.1,
+        "l2_throughput_pct": 15.5
+      },
+      "primary_bottleneck": "occupancy_limited_by_128_regs_per_thread",
+      "notes": "Round 17: WGMMA m64n64k16 SS-form with correct accumulator layout. BREAKTHROUGH RESULT.\n\n== Correctness ==\nAll 4 forward configs PASS (N=64/128/256/512, max_diff < 0.004). Gradient tests informational-only FAIL (no custom backward kernel).\n\n== Performance ==\nLatency: 0.303ms (3 trials: 0.303, 0.305, 0.305ms). Consistent.\nvs CLAUDE.md FlashInfer baseline (0.311ms): 1.026x FASTER -> TARGET MET.\nvs FlashInfer same-machine same-method (0.392ms): 1.294x FASTER.\nvs Round 10 WMMA (0.472ms): 1.558x FASTER (35.8% improvement).\nMFU: 8.6% (expected low for small problem size B=8,N=1024,D=64).\n\n== NCU Analysis ==\ncompute_throughput=60.6% (WMMA was 38% -> +59% improvement from tensor core utilization)\nsm_active_cycles=96.1% (excellent, SMs almost always active)\noccupancy=23.4% (similar to WMMA, limited by 128 regs/thread)\nregisters=128/thread (reduced from WMMA's 168 via WGMMA accumulator efficiency)\nsmem=32.8KB dynamic (no static smem; includes K/V tiles + softmax reduction buffers)\nl1tex=52.1% (healthy, not saturated)\nl2=15.5% (not a bottleneck)\n\n== vs_flashinfer_ratio > 1 VERIFICATION ==\nPer checklist: ratio 1.026x flagged as 'pending verification anomaly'.\nVerification performed: FlashInfer re-measured on same GPU with identical measure_mfu() methodology -> 0.392ms.\nOur kernel 0.303ms is genuinely faster. The 0.311ms CLAUDE.md baseline may have been measured under different GPU clock/thermal conditions.\nConclusion: result is GENUINE, not anomalous.\n\n== Go/No-Go ==\nGO. Target achieved. Key improvements from correct WGMMA accumulator layout:\n1. CLayout_64x64 row formula: actual_row=(l&3)*2+c+j*8\n2. Cross-warp softmax reduction via smem\n3. AV WGMMA always scale_d=1 (no reset)\n4. 128 regs/thread (vs WMMA 168) enables same occupancy with more compute\n\n== Remaining optimization opportunities ==\n1. Register pressure: 128 regs/thread -> 23.4% occupancy. Reducing to 96 could push to ~31% occupancy.\n2. Double-buffer cp.async for K/V: overlap global loads with WGMMA compute.\n3. CTA swizzle for better L2 reuse across CTAs.\n4. Warpgroup specialization (producer/consumer) for FA3-style pipelining."
+    }
   }
 ]

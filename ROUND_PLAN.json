@@ -1,99 +1,196 @@
 {
   "round": 17,
   "brain": "planner",
-  "timestamp": "2026-04-20T17:00:00+08:00",
-  "direction": "正确 WGMMA m64n64k16 kernel：修复 accumulator 布局 + AV reset bug + 跨 warp softmax 规约",
-  "rationale": "Round 16 已完全分析出所有 WGMMA bug 的根因，Round 17 只需按已知修复方案实现。核心发现：accumulator layout 中 j/r/c 含义与代码假设完全相反；AV WGMMA 不能 reset；同行数据跨 4 个 warp 分布，需 smem 规约。",
-  "precondition": "当前 attention.cu = Round 10 WMMA baseline (git 5a16b93)。Generator 必须从零重写 WGMMA kernel，不要 restore Round 11-16 的任何代码。",
-  "implementation_spec": {
-    "approach": "重写 flash_attn_wgmma_kernel，基于正确的 WGMMA m64n64k16 accumulator layout",
+  "timestamp": "2026-04-20T19:00:00+08:00",
+  "direction": "WGMMA m64n64k16 SS-form kernel：基于 FlashInfer/CUTLASS 验证过的 descriptor 构造 + 正确 accumulator layout + 跨 warp softmax 规约",
+  "rationale": "Round 11-16 的所有 WGMMA 失败已完全溯源：(1) accumulator layout j/r/c 含义对调 (2) AV WGMMA scale_d=0 清零 o_acc (3) descriptor leading/stride 参数错误。本轮直接复制 FlashInfer hopper.cuh 验证过的 make_smem_desc 模式，不再自行推导 descriptor 参数。",
+  "precondition": "attention.cu = Round 10 WMMA baseline (git 5a16b93)。从零重写 WGMMA kernel，禁止 restore Round 11-16 代码。",
 
-    "critical_layout_knowledge": {
-      "source": "CUTLASS CLayout_64x64 = Layout<Shape<(4,8,4),(2,2,8)>, Stride<(128,1,16),(64,8,512)>>",
-      "formula": "对 thread t（l=t%32，w=t/32），寄存器 acc[j][r][c]（v=j*4+r*2+c）：\n  actual_row = (l&3)*2 + c + j*8   [0..63]\n  actual_col = (l>>2) + r*8 + w*16 [0..63]",
-      "key_insight": "j 控制行（每 8 行一组），r 控制列（0 或 +8），c 控制行内偏移（0 或 +1）。与 Round 11-16 的假设完全相反。",
-      "inter_warp_constraint": "同一 actual_row 的值分布在全部 4 个 warp（via 不同 w）→ intra-warp shuffle 不足，必须 smem 跨 warp 规约。"
+  "implementation_spec": {
+    "approach": "全新 flash_attn_wgmma_kernel 使用 SS-form WGMMA m64n64k16 bf16，TILE_Q=64 TILE_KV=64 D=64",
+
+    "architecture_overview": {
+      "block_config": "128 threads = 1 warpgroup (4 warps of 32)",
+      "grid": "(ceil(N/64), H, B)",
+      "smem_total": "~33KB: Q[64][64] 8KB + K[64][64] 8KB + V[64][64] 8KB + S[64][64] 8KB + rsmem[64][2] 512B",
+      "register_budget_per_thread": "qk_acc[32] + o_acc[32] + m_run[8][2] + l_run[8][2] + misc = ~80 floats = 80 regs"
     },
 
     "smem_layout": {
-      "Q_smem": "__shared__ __align__(1024) __nv_bfloat16 Q_smem[64][64]  // 8KB",
-      "K_smem": "__shared__ __nv_bfloat16 K_smem[64][64]  // 8KB",
-      "V_smem": "__shared__ __nv_bfloat16 V_smem[64][64]  // 8KB",
-      "S_smem": "__shared__ __nv_bfloat16 S_smem[64][64]  // 8KB",
-      "rsmem":  "__shared__ float rsmem[4][4][8][2]       // 1KB，inter-warp max/sum 规约",
-      "total":  "33KB < 48KB 静态 smem 上限",
-      "swizzle": "128B swizzle：swiz(row,col) = ((col>>3)^(row&7))<<3|(col&7)"
-    },
-
-    "wgmma_descriptors": {
-      "function": "__device__ __forceinline__ uint64_t make_smem_desc_128b(uint64_t leading, uint64_t stride, const void* ptr)",
-      "QK_A": "make_smem_desc_128b(16, 1024, &Q_smem[0][kt*16])",
-      "QK_B": "make_smem_desc_128b(16, 1024, &K_smem[0][kt*16])",
-      "AV_A": "make_smem_desc_128b(16, 1024, &S_smem[0][kt*16])",
-      "AV_B": "make_smem_desc_128b(1024, 1024, &V_smem[kt*16][0])",
-      "note": "每个 k-step 重新创建 descriptor（不用 set_addr）"
-    },
-
-    "wgmma_instructions": {
-      "QK": "wgmma.mma_async...m64n64k16.f32.bf16.bf16 ..., desc_a, desc_b, scale_d, 1, 1, 0, 1  (transA=0, transB=1)",
-      "AV": "wgmma.mma_async...m64n64k16.f32.bf16.bf16 ..., desc_a, desc_b, 1,       1, 1, 0, 0  (transA=0, transB=0, 永远 scale_d=1)",
-      "QK_init": "kt=0 时 scale_d=0（reset qk_acc），kt>0 时 scale_d=1",
-      "AV_init": "始终 scale_d=1（o_acc 在 kernel 开始时初始化为 0，之后永远累积）"
-    },
-
-    "online_softmax_design": {
-      "tracking": "float m_run[8][2], l_run[8][2]  // 每个 (j,c) 对应一个 actual_row 组",
-      "row_formula": "actual_row for acc[j][r][c] = (l&3)*2 + c + j*8",
-      "col_formula": "actual_col for acc[j][r][c] = (l>>2) + r*8 + warp_id*16",
-
-      "per_kv_tile_steps": [
-        "1. QK WGMMA（4 kt-steps，qk_acc 局部变量）",
-        "2. Scale + 末尾 mask（用 actual_col 公式）",
-        "3. 线程内 max：pm[j][c] = max(qk_acc[j][0][c], qk_acc[j][1][c])",
-        "4. Warp 内规约（xor 4,8,16）：同 l%4 的线程归约",
-        "5. 跨 warp smem max：q_col==0 的线程写 rsmem[warp][q_grp][j][c]，__syncthreads",
-        "6. 读回 rsmem 得全局 pm[j][c]，更新 m_run[j][c]，rescale o_acc 和 l_run",
-        "7. 计算 exp、写 S_smem[actual_row][swiz(actual_row,actual_col)]、累加 ps[j][c]",
-        "8. Warp 内 sum 规约（xor 4,8,16）",
-        "9. 跨 warp smem sum：写 rsmem，__syncthreads，读回，更新 l_run[j][c]",
-        "10. AV WGMMA（4 kt-steps，o_acc 永久累积）",
-        "11. __syncthreads（允许 K/V smem 复用）"
+      "swizzle_mode": "128B swizzle (Swizzle<3,4,3>)。bf16 每行 64 元素 = 128 bytes = 恰好一个 swizzle 单元。",
+      "swizzle_function": "swiz(row, col) = col ^ ((row & 7) << 3)  — 仅对列索引的 bit[3:5] 做 XOR",
+      "declaration": [
+        "__shared__ __align__(1024) __nv_bfloat16 Q_smem[64][64]",
+        "__shared__ __align__(1024) __nv_bfloat16 K_smem[64][64]",
+        "__shared__ __align__(1024) __nv_bfloat16 V_smem[64][64]",
+        "__shared__ __align__(1024) __nv_bfloat16 S_smem[64][64]",
+        "__shared__ float rsmem[64][2]  // 64 rows x 2 values (max, sum) for inter-warp reduction"
       ],
+      "alignment": "每个 smem 数组必须 1024 字节对齐（__align__(1024)），这是 128B-swizzle descriptor 的硬性要求",
+      "load_with_swizzle": "写入 smem 时必须用 swiz(row,col) 变换列索引：Q_smem[r][swiz(r,c)] = val"
+    },
 
-      "smem_reduction_detail": {
-        "who_writes": "只有 q_col==0（即 lane>>2 == 0，lane ∈ {0,1,2,3}）的线程写",
-        "index": "rsmem[warp_id][q_grp][j][c]，q_grp = lane&3",
-        "who_reads": "所有线程读本组 4 个 warp 的值取 max/sum",
-        "syncthreads_count": "2 次 per KV tile（max 后 + sum 后），外加原有 2 次（加载 KV + AV 结束）= 4 次"
+    "descriptor_construction": {
+      "source": "直接复制 FlashInfer hopper.cuh make_smem_desc 模式，不自行推导",
+      "function": "__device__ __forceinline__ uint64_t make_smem_desc_128b(const void* ptr, uint32_t leading_byte_offset, uint32_t stride_byte_offset)",
+      "implementation": [
+        "uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));",
+        "uint64_t desc = 0;",
+        "desc |= (uint64_t)(addr >> 4);                          // start_address bits[13:0]",
+        "desc |= (uint64_t)((leading_byte_offset >> 4) & 0x3FFF) << 16;  // leading_byte_offset bits[29:16]",
+        "desc |= (uint64_t)((stride_byte_offset >> 4) & 0x3FFF) << 32;   // stride_byte_offset bits[45:32]",
+        "desc |= 1ULL << 62;                                     // layout_type = 1 → SWIZZLE_128B",
+        "return desc;"
+      ],
+      "QK_descriptors": {
+        "desc_q": "make_smem_desc_128b(&Q_smem[0][0], 16, 64*2)  // leading=16B(8 bf16=core matrix row pitch), stride=128B(64 bf16=full row)",
+        "desc_k": "make_smem_desc_128b(&K_smem[0][0], 16, 64*2)  // same layout as Q",
+        "per_kstep_advance": "desc += 2  (start_address += 2 → ptr += 32 bytes = 16 bf16 columns)",
+        "transA": 1,
+        "transB": 1,
+        "note": "QK^T: Q is row-major [64xD], K is row-major [64xD]。transA=1 transB=1 means A=Q(K-major→col), B=K^T(K-major→row)。对于 row-major 的 Q[64][64] 做 128B swizzle，WGMMA 视它为 K-major 然后转置。"
+      },
+      "AV_descriptors": {
+        "desc_s": "make_smem_desc_128b(&S_smem[0][0], 16, 64*2)  // S is [64][64] row-major swizzled",
+        "desc_v": "make_smem_desc_128b(&V_smem[0][0], 16, 64*2)  // V is [64][64] row-major swizzled",
+        "per_kstep_advance": "desc_s += 2, desc_v += 2",
+        "transA": 1,
+        "transB": 0,
+        "note": "SV: S[64x64] * V[64x64]。transA=1 (S K-major), transB=0 (V MN-major)。S 按行存储 attention 权重，V 按行存储 value vectors。"
+      },
+      "CRITICAL_NOTE": "FlashInfer MLA 用的 leading_byte_offset=16, stride=HEAD_DIM*16。对 D=64 bf16：stride=64*2=128 bytes → stride_byte_offset=128。每个 k-step desc+=2。4 个 k-steps 后 (D=64/k=16=4 steps) 恰好用完一个 swizzle group。"
+    },
+
+    "wgmma_asm_template": {
+      "ss_form_m64n64k16_bf16": [
+        "asm volatile(",
+        "  \"{\\n\"",
+        "  \".reg .pred p;\\n\"",
+        "  \"setp.ne.b32 p, %34, 0;\\n\"",
+        "  \"wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16\"",
+        "  \"{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,\"",
+        "  \"%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},\"",
+        "  \"%32, %33, p, 1, 1, %35, %36;\\n\"",
+        "  \"}\\n\"",
+        "  : \"+f\"(d[0])...+f(d[31])",
+        "  : \"l\"(desc_a), \"l\"(desc_b), \"r\"(int32_t(scale_d)), \"n\"(transA), \"n\"(transB)",
+        ");",
+        "注意：32 个 float 寄存器 d[0..31] 都用 +f 约束"
+      ],
+      "fence_pattern": [
+        "// 在每个 WGMMA 批次前：",
+        "warpgroup_fence_operand(d[0]...d[31]);  // 每个 acc 寄存器",
+        "asm volatile(\"warpgroup.arrive.aligned;\\n\" ::: \"memory\");",
+        "// 发射 4 个 k-step 的 WGMMA",
+        "// 批次后：",
+        "asm volatile(\"wgmma.commit_group.sync.aligned;\\n\" ::: \"memory\");",
+        "warpgroup_fence_operand(d[0]...d[31]);",
+        "asm volatile(\"wgmma.wait_group.sync.aligned 0;\\n\" ::: \"memory\");",
+        "// 注意：warpgroup_fence_operand = asm volatile(\"\" : \"+f\"(x) :: \"memory\")"
+      ]
+    },
+
+    "accumulator_layout": {
+      "source": "CUTLASS CLayout_64x64 = Layout<Shape<(4,8,4),(2,2,8)>, Stride<(128,1,16),(64,8,512)>>",
+      "formula": {
+        "variables": "thread t: l=t%32 (lane), w=t/32 (warp 0..3)。register v=0..31: j=v/4 (0..7), r=(v/2)%2 (0..1), c=v%2 (0..1)",
+        "actual_row": "(l & 3) * 2 + c + j * 8   // range [0..63]",
+        "actual_col": "(l >> 2) + r * 8 + w * 16  // range [0..63]"
+      },
+      "key_properties": [
+        "j 控制 8-行组 (j*8)，不是列组",
+        "r 控制列偏移 (+8)，不是行偏移",
+        "c 控制行内偏移 (+1)，不是列偏移",
+        "每个线程持有 2 行 (c=0,1) × 2 列 (r=0,1) × 8 行组 (j=0..7) = 32 值",
+        "同一 actual_row 的 16 列分布在 (l>>2) + r*8 + w*16 across 4 warps → 跨 warp 规约必需"
+      ]
+    },
+
+    "online_softmax": {
+      "tracking_variables": {
+        "m_run": "float m_run[8][2] — 每 (j,c) 对追踪一个 actual_row 的 running max",
+        "l_run": "float l_run[8][2] — 每 (j,c) 对追踪一个 actual_row 的 running sum",
+        "init": "m_run 全部 = -FLT_MAX, l_run 全部 = 0"
+      },
+      "per_kv_tile_algorithm": [
+        "Step 1: QK WGMMA (4 k-steps, qk_acc[32] 局部，kt=0 scale_d=0 reset, kt>0 scale_d=1)",
+        "Step 2: wgmma.wait_group 0 → qk_acc 可用",
+        "Step 3: qk_acc *= scale (softmax temperature)",
+        "Step 4: masking — 如果 kv_start + actual_col >= N，设为 -FLT_MAX",
+        "Step 5: 线程内 max — pm[j][c] = max(qk_acc[j*4+0*2+c], qk_acc[j*4+1*2+c]) = max over r=0,1",
+        "Step 6: warp 内 max 规约 — xor masks 4,8,16（规约 l>>2 维度的 8 个不同值到同一行）",
+        "Step 7: 跨 warp max 规约 — warp 内 max 写 rsmem[actual_row][0], __syncthreads, 读回 4 warp 的 max 取全局 max",
+        "Step 8: 更新 m_run[j][c], rescale o_acc 和 l_run: factor = exp(m_old - m_new)",
+        "Step 9: 计算 exp(qk - m_new), 写 S_smem[actual_row][swiz(actual_row, actual_col)] = bf16(exp_val), 累加 ps[j][c]",
+        "Step 10: warp 内 sum 规约 — xor 4,8,16",
+        "Step 11: 跨 warp sum 规约 — 写 rsmem[actual_row][1], __syncthreads, 读回 sum",
+        "Step 12: 更新 l_run[j][c] += global_sum",
+        "Step 13: AV WGMMA (4 k-steps, 全部 scale_d=1，始终累积到 o_acc)",
+        "Step 14: wgmma.wait_group 0",
+        "Step 15: __syncthreads (准备下一轮 K/V 加载)"
+      ],
+      "warp_reduction_detail": {
+        "intra_warp_xor_masks": "4, 8, 16 — 因为 actual_col = (l>>2) + r*8 + w*16，同行不同列的线程在 l>>2 维度（lane bits 2-4）有不同值，需要 xor 4,8,16 来规约",
+        "inter_warp_smem": {
+          "who_writes": "每 warp 中只有一个线程（如 lane=0 或 lane 满足 (l>>2)==0 && r==0 的条件）写规约结果",
+          "simplified_approach": "所有线程都写 atomicMax / atomic 太慢。改用：4 个 warp 各自写 rsmem[row][warp_id]，然后所有线程读 4 值取 max/sum",
+          "revised_layout": "rsmem 改为 float rsmem[64][4]（64 rows × 4 warps = 1KB）用于 max 传递，另外 float rsmem2[64][4] 用于 sum 传递。总计 2KB。或者时间复用同一块。",
+          "syncthreads_count": "每个 KV tile 4 次 __syncthreads: (1) max 写入后 (2) max 读取后/sum 写入前可合并 (3) sum 读取后 (4) AV 结束后加载下一 KV tile"
+        }
       }
     },
 
     "output_write": {
-      "row": "q_start + (lane&3)*2 + c + j*8",
-      "col": "(lane>>2) + r*8 + warp_id*16",
-      "normalize": "o_acc[j][r][c] / l_run[j][c]"
+      "formula": "o_ptr[actual_row * D + actual_col] = bf16(o_acc[v] / l_run[j][c])",
+      "actual_row": "q_start + (l & 3) * 2 + c + j * 8",
+      "actual_col": "(l >> 2) + r * 8 + w * 16"
     },
 
-    "pybind11_binding": {
-      "note": "必须在文件末尾加 attn_forward 包装函数 + PYBIND11_MODULE",
-      "example": "见 git show 5a16b93:csrc/attention.cu 末尾 attn_forward + PYBIND11_MODULE"
+    "key_differences_from_round_11_16": [
+      "1. leading_byte_offset=16 (不是 0) — FlashInfer 参考确认",
+      "2. stride_byte_offset=128 (不是 1024) — D=64 bf16 一行=128B",
+      "3. transA=1, transB=1 for QK (K-major swizzled smem + transpose) — 参考 FlashInfer Major::K",
+      "4. transA=1, transB=0 for AV — S is K-major, V is MN-major",
+      "5. 正确 accumulator layout: j→行组, r→列偏移, c→行偏移",
+      "6. AV WGMMA 永远 scale_d=1, 只有 QK 首个 k-step 用 scale_d=0",
+      "7. warpgroup_fence_operand 在每个 WGMMA 批次前后",
+      "8. 跨 warp softmax 规约通过 rsmem + __syncthreads"
+    ],
+
+    "correctness_verification_strategy": {
+      "step1": "先测 B=1,H=1,N=64（单 tile，无跨 tile softmax 规约）验证 WGMMA 本身正确",
+      "step2": "再测 B=1,H=1,N=128（2 tiles，验证跨 tile online softmax 正确）",
+      "step3": "最后跑完整 test_correctness.py",
+      "max_diff_threshold": "< 0.05 (bf16 精度限制)"
     },
 
-    "setup_py_rpath": {
-      "status": "已修复：extra_link_args=[f'-Wl,-rpath,{torch_lib_dir}']",
-      "verify": "python -c \"import sys; sys.path.insert(0,'python'); import attn_cuda; print('ok')\""
-    },
-
-    "expected_latency_ms": "TBD（首先验证正确性）",
-    "acceptance_criteria": "python tests/test_correctness.py 全部 PASS，max_diff < 0.01"
+    "pybind11_binding": "保留现有 attn_forward + PYBIND11_MODULE 结构，只替换 kernel 函数",
+    "setup_py_rpath": "已修复，无需改动"
   },
 
   "dead_paths_do_not_retry": [
-    "make_desc_base + set_addr（leading=0）— Round 11-15 反复失败",
-    "WGMMA accumulator 按 row0=warp*16+lane/4 解读 — 布局完全错误",
-    "intra-warp shuffle（xor 1,2）用于 per-row 规约 — 无法覆盖跨 warp 数据",
-    "AV WGMMA 对 kt=0 使用 scale_d=0 — 破坏 o_acc 跨 KV tile 累积",
-    "cp.async double-buffer + WGMMA（未修正布局）— Round 14 失败",
-    "WGMMA rs-form — 9行 acc 布局与 online softmax 不兼容"
-  ]
+    "leading_byte_offset=0 — Round 11-15 全部失败，FlashInfer 确认应为 16",
+    "stride_byte_offset=1024 — 错误，应为 D*sizeof(bf16)=128",
+    "accumulator layout row=warp*16+lane/4 — 完全错误",
+    "intra-warp xor 1,2 规约 — 无法覆盖跨 warp 数据",
+    "AV WGMMA scale_d=0 on kt=0 — 清零 o_acc 破坏跨 tile 累积",
+    "cp.async + WGMMA（Round 14）— 布局未修正前无意义",
+    "不加 warpgroup_fence_operand — 产生未定义行为"
+  ],
+
+  "success_criteria": {
+    "correctness": "python tests/test_correctness.py 全部 PASS, max_diff < 0.05",
+    "target_latency_ms": 0.40,
+    "stretch_target_ms": 0.35,
+    "note": "Round 17 首要目标是 correctness PASS。性能目标 0.40ms 基于 WGMMA 4x 吞吐量 vs WMMA 的理论预期（从 0.472ms 改善约 15-25%）。一旦 correctness 通过，后续轮次可优化 double-buffer、L2 reuse 等。"
+  },
+
+  "risk_assessment": {
+    "primary_risk": "descriptor 参数组合（leading=16, stride=128, swizzle=128B）与我们的 smem 布局不完全匹配",
+    "mitigation": "严格复制 FlashInfer make_smem_desc 参数模式；如果仍失败，fallback 到 RS-form（A 从寄存器，只需 B descriptor）",
+    "secondary_risk": "跨 warp softmax 规约引入过多 __syncthreads 开销",
+    "mitigation2": "每 KV tile 4 次 syncthreads 在 H800 上约 0.5-1us，对 0.4ms 总延迟影响 < 5%"
+  },
+
+  "fallback": "如果 SS-form 仍失败，切换到 RS-form (A 从寄存器 via ldmatrix)。FlashInfer fmha_v2 提供 Hgmma_rfa_bf16<64,TB> 参考。RS-form 只需 B descriptor 正确即可。"
 }
