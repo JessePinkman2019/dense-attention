@@ -32,7 +32,7 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 ```bash
 # Planner
-ept claude --model gpt-5_4 --dangerously-skip-permissions \
+ept claude --model gpt-5_4 --permission-mode auto \
   -p "$(cat <<'PROMPT'
 你是 /planner。工作目录：/chj/home/wanglang3/code/dense-attention
 读取 optimization_session.json 最近3轮，结合 csrc/attention.cu 现状，
@@ -42,7 +42,7 @@ PROMPT
 )"
 
 # Generator
-ept claude --model minimax-m2.5 --dangerously-skip-permissions \
+ept claude --model minimax-m2.5 --permission-mode auto \
   -p "$(cat <<'PROMPT'
 你是 /generator。工作目录：/chj/home/wanglang3/code/dense-attention
 读取 ROUND_PLAN.json，按 implementation_spec 修改 csrc/attention.cu，
@@ -51,7 +51,7 @@ PROMPT
 )"
 
 # Evaluator
-ept claude --model minimax-m2.5 --dangerously-skip-permissions \
+ept claude --model minimax-m2.5 --permission-mode auto \
   -p "$(cat <<'PROMPT'
 你是 /evaluator。工作目录：/chj/home/wanglang3/code/dense-attention
 对最新 git commit 执行强制 Checklist（Step 1-7，见下方），
