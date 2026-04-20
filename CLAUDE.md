@@ -16,6 +16,11 @@ cat csrc/attention.cu
 cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 ```
 
+> **若最近3轮 correctness_pass 全为 False**：向前查找最后一个 correctness_pass=True 的轮次，
+> 用 `git log --oneline` 找到对应 commit，`git show <hash>:csrc/attention.cu` 恢复为 baseline，
+> 再运行 `python tests/test_correctness.py` 验证后再继续。
+> 当前已知 baseline：**Round 10 WMMA，git 5a16b93，0.472ms**。
+
 ## 角色（各自独立 Agent，上下文不共享）
 
 三个角色均以**独立进程**方式启动，通过 Bash tool 调用 `ept claude`，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：

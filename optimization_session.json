@@ -238,7 +238,7 @@
     "timestamp": "2026-04-19T17:15:03.117352",
     "factual_analysis": {
       "compile_success": true,
-      "correctness_pass": true,
+      "correctness_pass": false,
       "latency_ms": {
         "N1024_B8": 0.434
       },
@@ -249,7 +249,7 @@
         "smem_kb": 32.0
       },
       "primary_bottleneck": "scalar_smem_loads_no_pipelining",
-      "notes": "Round 11: WGMMA m64n64k16 BF16 + 128B swizzle smem. 0.434ms (vs WMMA 0.472ms = +8.9%, vs FlashInfer 0.311ms = -28%). Single warpgroup, 128 threads. Sequential K/V loading with scalar ld.global. Next: vectorized 128-bit loads (cp.async) + double-buffer pipelining to hide load latency."
+      "notes": "Round 11: WGMMA m64n64k16 BF16 + 128B swizzle smem. 0.434ms (vs WMMA 0.472ms = +8.9%, vs FlashInfer 0.311ms = -28%). Single warpgroup, 128 threads. Sequential K/V loading with scalar ld.global. Next: vectorized 128-bit loads (cp.async) + double-buffer pipelining to hide load latency.\n\n[2026-04-20 修正] correctness_pass 应为 False。Round 11 的 WGMMA ss-form 与 round 12-14 有相同 bug (max_diff=0.914)。当时 evaluator 存在'自己评估自己'偏差，误报为 True。真正最后正确 kernel：Round 10 WMMA 0.472ms。"
     }
   },
   {
@@ -278,6 +278,69 @@
       },
       "primary_bottleneck": "wgmma_b128_layout_incompatible_with_standard_smem",
       "notes": "Round 13 TMA+WGMMA exhaustive diagnosis:\nBREAKTHROUGHS:\n1. TMA now works correctly (after discovering correct PTX protocol):\n   - Must use mbarrier.arrive.expect_tx (BOTH arrives count AND expects TX) NOT separate init+expect_tx\n   - TMA instruction: .tile qualifier required, no .L2::cache_hint, 32-bit smem addr, 64-bit global addr\n   - Protocol: mbar_init(count=1) -> arrive.expect_tx(bytes) -> TMA -> mbar_wait(parity=0)\n2. B128 WGMMA B descriptor confirmed incompatible with standard smem layout:\n   - B128 K-inner stride W=8 uint128_t = 8 full rows (for 128-byte row matrices)\n   - For [TKV][HD] matrix: K-inner elements u=0 and u=1 need to be 8 rows apart\n   - But k=0..7 and k=8..15 of same TKV-row are 1 uint128_t apart (adjacent cols), NOT 8 rows\n   - Empirically confirmed: all j-groups read from rows 7-8 regardless of intended TKV position\n   - Difference per j-group = 8 (= 1 uint128_t), not 512 (= j*8 rows difference)\n   - SBO=64, B128, TMA-loaded: D[j] = 32256+512j instead of 0+512j\n   - Root cause: canonical B128 MN-major requires K[TKV=j][HD=0..7] and K[TKV=j][HD=8..15] to be\n     8 full rows apart in smem, but standard row-major and TMA store them in adjacent columns\nDEAD PATHS:\n- All SBO/LBO combinations (0..256) with B128 descriptor: wrong\n- kNONE (INTERLEAVE): reads only k=0,8,16,...,56 (sparse), k-advance non-functional\n- transB=0/transB=1 manual layouts: same incompatibility\n- TMA-loaded B128 with SBO=64: same wrong pattern as manual\nCONCLUSION: WGMMA m64n64k16 BF16 for flash attention requires FA3 architecture:\n  - Producer/consumer warp specialization\n  - TMA in SPECIFIC interleaved tile configuration (not standard row-major)\n  - Warpgroup-level online softmax\n  - Cannot be implemented by simple WMMA->WGMMA replacement\nCurrent best: Round 10 WMMA 0.472ms (reverted to this)"
+    }
+  },
+  {
+    "round": 14,
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T10:57:22.164063",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "vs_flashinfer_ratio": {
+        "N1024_B8": null
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": null,
+        "sm_active_cycles_pct": null,
+        "occupancy_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": null,
+        "l1tex_throughput_pct": null,
+        "l2_throughput_pct": null
+      },
+      "primary_bottleneck": "wgmma_b128_descriptor_incompatible_with_cp_async_smem_layout",
+      "notes": "Round 14 CORRECTNESS FAIL (max_diff=1.219, mean_diff=0.195). Performance testing skipped per checklist.\n\nROOT CAUSE (same as Round 12-13 dead path):\nRound 14 re-introduced double-buffer cp.async on top of Round 11 WGMMA ss-form baseline WITHOUT fixing the fundamental B128 descriptor incompatibility.\n- WGMMA QK (transB=1) uses B128 descriptor for K_smem loaded via cp.async 128-bit stores.\n- WGMMA AV (transB=0) uses B128 descriptor for V_smem loaded via cp.async 128-bit stores.\n- B128 WGMMA descriptor requires hardware-specific K-inner stride W=8 uint128_t (8 full rows) in smem.\n- cp.async stores K/V in standard row-major layout: K-inner elements at adjacent columns, not 8 rows apart.\n- This mismatch causes all WGMMA B-operand reads to be completely wrong.\n- Round 11 achieved correctness (0.434ms) but Round 14 changed smem structure (double buffering + descriptor offsets) which broke correctness.\n\nGO/NO-GO: NO-GO. DEAD PATH confirmed (3rd time). cp.async double-buffer on WGMMA ss-form B128 is fundamentally broken.\n\nACTION REQUIRED FOR PLANNER:\n1. ABANDON all WGMMA ss-form with cp.async/manual smem stores for K/V B-operand.\n2. Three viable paths:\n   a. Revert to Round 11 baseline (0.434ms, correct) and optimize WITHOUT changing smem layout:\n      - Vectorized 128-bit Q loads (ldg.128) but no double-buffering\n      - CTA swizzle / grid config for better L2 reuse\n      - Target: 0.380-0.400ms as next milestone\n   b. FA3 full architecture: TMA with hardware-interleaved tile config + warpgroup producer/consumer specialization\n      - Only path to match FlashInfer 0.311ms\n      - High complexity, high reward\n   c. WGMMA rs-form for QK (Q from registers, K stays as B-descriptor)\n      - rs-form avoids Q-descriptor issue; K B-descriptor problem remains for ss-form\n3. ncu_metrics all null: correctness failed at B=2,H=4,N=64,D=64 (first config);\n   performance profiling correctly suppressed per evaluator checklist protocol."
+    }
+  },
+  {
+    "round": "14_debug",
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T12:49:05.739093",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": false,
+      "latency_ms": {
+        "N1024_B8": null
+      },
+      "ncu_metrics": {
+        "compute_throughput_pct": null,
+        "sm_active_cycles_pct": null,
+        "occupancy_pct": null,
+        "registers_per_thread": null,
+        "smem_kb": null,
+        "l1tex_throughput_pct": null,
+        "l2_throughput_pct": null
+      },
+      "primary_bottleneck": "wgmma_ss_form_produces_wrong_results_regardless_of_descriptor_tuning",
+      "notes": "Round 14 深度诊断（本 session 实验结论，供后续参考）：\n\n== 诊断方法 ==\n通过构造 4 种组合内核进行阶段性隔离：\n1. WGMMA QK + scalar AV：max_diff=1.407 → FAIL（QK WGMMA 有误）\n2. scalar QK + WGMMA AV：max_diff=2.117 → FAIL（AV WGMMA 有误）\n3. scalar QK + scalar AV：max_diff=0.003 → PASS（算法正确，smem swizzle 一致）\n结论：两个 WGMMA 阶段均独立出错，算法本身与 smem 读写布局均正确，BUG 在 WGMMA 指令执行层面。\n\n== 已排除的 BUG 原因 ==\n- swiz() 函数错误：排除（scalar 测试通过）\n- smem 对齐问题：排除（所有数组均 1024B 对齐）\n- 在线 softmax 算法错误：排除（pure-Python FlashAttn: max_diff=0.000001）\n- make_desc_base 构造错误：参考 deep_gemm/mma_utils.cuh 和 flashinfer/hopper.cuh，我们的构造方式（stride=64, leading=0, layout_type=1）与参考代码一致\n- set_addr 实现错误：ptr/16 < 4096 < 2^14，不会溢出 start_address 字段\n- wgmma.fence/commit/wait 缺少 \"memory\" clobber：添加后仍失败\n- 缺少 warpgroup_fence_operand（CUTLASS 模式）：添加后仍失败\n- transA/transB 参数错误：分析确认 transB=1(QK) 和 transB=0(AV) 均正确\n\n== 持续存在的谜 ==\ndescriptor 构造与参考代码逻辑一致，fence/clobber 已添加，算法已验证，但 WGMMA 仍然错误。\nmax_diff=1.219 跨所有修改保持不变，这本身就很可疑（确定性错误而非随机）。\n\n== 待尝试的方向（给 planner）==\n选项 A（保守）：\n  - 放弃 WGMMA ss-form，回退到 Round 11 WMMA baseline（0.434ms，已知正确）\n  - 在 WMMA baseline 基础上尝试：CTA swizzle、L2 reuse 优化、更激进的 tile size\n  - 目标：先稳定在 0.380-0.400ms，再考虑 WGMMA\n\n选项 B（激进但可能有效）：\n  - 直接复制 flashinfer/data/include/flashinfer/attention/hopper.cuh 中的 make_smem_desc\n    和 get_swizzle_offset 函数（这是已验证可用的 H800 WGMMA 参考实现）\n  - 用该函数替换我们的 make_desc_base + swiz + set_addr\n  - 目标：复现 FlashInfer 的 WGMMA 工作方式\n\n选项 C（中间）：\n  - WGMMA rs-form：Q 和 S 用 ldmatrix 从寄存器加载（rs-form），避免 A 描述符问题\n  - K 和 V 的 B 描述符 ss-form 问题依然存在\n\n== 关键参考文件位置 ==\n- /opt/conda/lib/python3.10/site-packages/flashinfer/data/include/flashinfer/attention/hopper.cuh\n  → make_smem_desc<SwizzleMode::k128B>(ptr) 和 get_swizzle_offset 函数\n- /opt/conda/lib/python3.10/site-packages/flashinfer/data/csrc/nv_internal/tensorrt_llm/deep_gemm/mma_utils.cuh\n  → make_smem_desc(ptr, layout_type=1, leading=0, stride=1024)\n- /opt/conda/lib/python3.10/site-packages/flashinfer/data/cutlass/include/cute/arch/mma_sm90_desc.hpp\n  → GmmaDescriptor bitfield 定义（已验证 layout_type=1 → bit62=1 = SWIZZLE_128B）"
+    }
+  },
+  {
+    "round": "baseline_restore",
+    "brain": "evaluator",
+    "timestamp": "2026-04-20T12:54:49.631188",
+    "factual_analysis": {
+      "compile_success": true,
+      "correctness_pass": true,
+      "latency_ms": {
+        "N1024_B8": 0.472
+      },
+      "primary_bottleneck": "wmma_ceiling_0.472ms",
+      "notes": "已恢复 Round 10 WMMA baseline (git: 5a16b93)。\n正确性验证通过 (N=64/128/256/512 全部 PASS)。\n\n== 完整历史修正 ==\nRound 11 (01eb002): correctness_pass 原记录为 True，实为 False (max_diff=0.914)。\nRound 12-14: WGMMA ss-form，全部 correctness_pass=False。\n唯一可用 WGMMA baseline 不存在，必须从 Round 10 WMMA 重新出发。\n\n== WGMMA ss-form 根本结论 ==\n诊断（本 session）：scalar 全通过，两个 WGMMA 阶段（QK transB=1, AV transB=0）均独立出错。\n错误稳定在 max_diff=1.219，跨 swizzle/descriptor/fence/clobber 所有修改不变。\n已排除：swizzle 函数、smem 对齐、软件算法、descriptor 构造（与 deep_gemm 一致）、fence memory clobber、warpgroup_fence_operand。\n未解决：为什么 WGMMA 产生确定性错误结果。\n\n== 下一轮方向建议 ==\nOption A（保守，推荐）：在 Round 10 WMMA 上做 L2 reuse / CTA swizzle / grid config 优化，目标 0.40ms。\nOption B（激进）：直接复制 flashinfer/data/include/flashinfer/attention/hopper.cuh 的\n  make_smem_desc<SwizzleMode::k128B> 和 get_swizzle_offset，完全替换我们的 swiz/make_desc_base/set_addr，\n  从第一性原理验证 WGMMA 是否能通过正确性测试。"
     }
   }
 ]
