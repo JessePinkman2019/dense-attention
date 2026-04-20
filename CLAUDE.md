@@ -18,22 +18,53 @@ cat ROUND_PLAN.json 2>/dev/null || echo "ROUND_PLAN.json 不存在"
 
 ## 角色（各自独立 Agent，上下文不共享）
 
-三个角色均以**异步子 Agent**（`Agent` tool，`run_in_background=false`）方式启动，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
+三个角色均以**独立进程**方式启动，通过 Bash tool 调用 `ept claude`，每个 Agent 只读持久化文件（session log / ROUND_PLAN.json / attention.cu），不依赖对话历史：
 
-| 角色 | 触发方式 | subagent_type | 输入 | 输出 |
-|------|----------|---------------|------|------|
-| `/planner` | `Agent` tool | `general-purpose` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
-| `/generator` | `Agent` tool | `general-purpose` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
-| `/evaluator` | `Agent` tool | `general-purpose` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
+| 角色 | 模型 | 输入 | 输出 |
+|------|------|------|------|
+| `/planner` | `azure-gpt-5_4` | `optimization_session.json`（最近3轮） | `ROUND_PLAN.json` |
+| `/generator` | `minimax-m2.5` | `ROUND_PLAN.json` + `csrc/attention.cu` | 新 `attention.cu` + git commit |
+| `/evaluator` | `minimax-m2.5` | 最新 git commit | `optimization_session.json` 追加一轮 + Memory 更新 |
 
 **顺序**：planner → generator → evaluator → planner → …（严格串行，不并行）
 
-**强制要求**：
-- 每个角色**必须**通过 `Agent` tool 以独立子 Agent 启动，禁止在主对话中直接执行角色逻辑。
-- 子 Agent prompt 必须包含：角色名、输入文件路径、输出文件路径、具体执行指令。
-- 主 Agent 只负责串行调度：等待上一个子 Agent 完成后再启动下一个。
+**执行方式**：主 Agent 通过 Bash tool 依次调用，等待每个进程完成后再启动下一个：
 
-> **上下文节省关键**：每次只开一个角色 Agent，完成后关闭。下一角色读持久化文件，不看聊天记录。
+```bash
+# Planner
+ept claude --model gpt-5_4 --dangerously-skip-permissions \
+  -p "$(cat <<'PROMPT'
+你是 /planner。工作目录：/chj/home/wanglang3/code/dense-attention
+读取 optimization_session.json 最近3轮，结合 csrc/attention.cu 现状，
+输出下一轮优化方向到 ROUND_PLAN.json。
+格式：{"round": N, "brain": "planner", "direction": "...", "implementation_spec": {...}, ...}
+PROMPT
+)"
+
+# Generator
+ept claude --model minimax-m2.5 --dangerously-skip-permissions \
+  -p "$(cat <<'PROMPT'
+你是 /generator。工作目录：/chj/home/wanglang3/code/dense-attention
+读取 ROUND_PLAN.json，按 implementation_spec 修改 csrc/attention.cu，
+然后执行：git add csrc/attention.cu && git commit -m "round_N: <描述>"
+PROMPT
+)"
+
+# Evaluator
+ept claude --model minimax-m2.5 --dangerously-skip-permissions \
+  -p "$(cat <<'PROMPT'
+你是 /evaluator。工作目录：/chj/home/wanglang3/code/dense-attention
+对最新 git commit 执行强制 Checklist（Step 1-7，见下方），
+结果追加到 optimization_session.json。
+PROMPT
+)"
+```
+
+**强制要求**：
+- 每个角色**必须**通过独立 `ept claude` 进程执行，禁止在主对话中直接执行角色逻辑。
+- 主 Agent 只负责串行调度：Bash tool 顺序执行，等待每个命令返回后再运行下一个。
+
+> **上下文节省关键**：每次只启动一个角色进程，完成后退出。下一角色读持久化文件，不看聊天记录。
 
 ### ⚠️ 角色分离失效的教训（Round 12-13 反面案例）
 
